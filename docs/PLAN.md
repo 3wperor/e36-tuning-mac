@@ -1,0 +1,80 @@
+# Plan
+
+Goal: a native Apple Silicon macOS tool to **read, log, tune and flash** the
+Siemens MS41 DME in an E36. No Windows, no VM.
+
+Target car: 1997 Euro E36 with an M52B25 engine, which means an MS41 DME. The
+exact variant is still unknown; `e36 ident` reads it from the car.
+
+## Architecture
+
+| Layer | What it does | Status |
+|---|---|---|
+| Transport | USB serial at 9600 baud, 8E1, handling of the K-line echo, timeouts | done (`crates/ds2/src/serial.rs`, `session.rs`) |
+| DS2 protocol | `[addr][len][payload][xor]` frames; the DME is at address `0x12` | done (`frame.rs`) |
+| Diagnostics | ECU identity, read and clear fault codes | done, raw output (`ms41.rs`) |
+| Fault decoding | Turn the raw fault bytes into codes and text | needs real captures from the car |
+| Logger | Read live values from RAM: gauges, CSV/MegaLogViewer export, wideband input | step 2 |
+| ECU definitions | Import the community TunerPro XDF files (tables, axes, scaling) | step 3 |
+| Map editor | 2D/3D tables, comparison against stock, undo, version history | step 3 |
+| Checksums | Recalculate MS41 checksums; refuse to flash if they don't match | step 3 |
+| Flasher | Identity check, full backup, erase, write, verify | step 4 |
+| Analysis | Fuel trim and wideband correction suggestions, knock per cylinder | step 5 |
+| GUI | Tauri desktop app on top of the same Rust core | starts with the logger |
+
+## Build order
+
+1. **Read-only CLI.** Connect, read the identity, read and clear faults.
+   Proves the cable, the 20-pin adapter and the protocol on the Mac. *(done;
+   needs testing on the car)*
+2. **Logger.** Live data in the terminal first, then the GUI with gauges and
+   CSV export.
+3. **Read the full binary and back it up.** Then XDF import, the map editor and
+   checksums.
+4. **Flashing**, with the safety plan below.
+5. **Analysis tools.**
+
+## Flashing without a spare ECU
+
+There's no spare ECU to practise on, so the car's own ECU is the test unit.
+That's riskier, and every step below exists to make a failed flash
+recoverable rather than fatal.
+
+1. **Backups before anything else.** Read the full ECU contents twice and
+   compare them byte for byte; they must match. Store copies in three places
+   (Mac, cloud, USB stick). The original file is never modified, so every tune
+   is a copy.
+2. **Check our reader against an established tool.** Read the same ECU once
+   with the established community tool, in a Windows VM if necessary. Our dump
+   must match it byte for byte before our writer is trusted.
+3. **Prove the recovery path first.** The MS41's processor has a bootstrap mode
+   ("bootmode") that lets it be reflashed even when its program is corrupted.
+   Before the **first write**, we get a bootmode **read** working on your ECU.
+   That's done with the ECU out of the car on the desk, powered by a cheap 12V
+   supply or the car battery. Once that works, a failed flash means an
+   afternoon of recovery, not a new ECU.
+4. **Write as little as possible.** Where possible, write only the calibration
+   (the maps) and leave the program code alone. That makes the write smaller
+   and faster, with less to go wrong.
+5. **Refuse unsafe flashes.** The tool won't flash if:
+   - the part or software number doesn't match the backup
+   - the checksums are wrong
+   - the file size is wrong
+   - battery voltage is below about 12.5 V
+6. **During a flash:**
+   - battery charger connected
+   - lights, fan and radio off; doors shut so the interior light stays off
+   - Mac plugged in, with sleep blocked (`caffeinate`)
+   - wired connection only
+7. **Verify after writing.** Read back and compare with what was written before
+   turning the ignition off.
+8. **Keep the first change tiny.** For example, one value in a map you can
+   easily check. That proves the whole write path end to end before any real
+   tuning.
+
+## Open questions
+
+- Exact DME part number and software version (`e36 ident` will show it).
+- How MS41 fault records are laid out. Capture `e36 faults --trace` from the
+  car, ideally once with a known fault (e.g. an unplugged sensor) and once
+  after clearing.

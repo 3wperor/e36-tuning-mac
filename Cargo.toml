@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/ds2", "crates/e36"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/3wperor/e36-tuning-mac"

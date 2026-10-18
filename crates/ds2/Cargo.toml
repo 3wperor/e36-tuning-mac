@@ -1,0 +1,16 @@
+[package]
+name = "ds2"
+description = "BMW DS2 diagnostic protocol over K-line (Siemens MS41 and friends)"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Real USB serial cable support (K+DCAN / KKL). Without it the crate is pure protocol + mock transport.
+serial = ["dep:serialport"]
+
+[dependencies]
+thiserror = "1"
+# No libudev: macOS uses IOKit, and Linux falls back to sysfs for port listing.
+serialport = { version = "4.5", default-features = false, optional = true }

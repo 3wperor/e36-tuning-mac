@@ -11,7 +11,10 @@ flash yet. See [docs/PLAN.md](docs/PLAN.md) for where this is heading
 ## Install (on the Mac)
 
 ```sh
-# Install Rust once
+# Apple's command line tools (Rust needs their linker); skip if already installed
+xcode-select --install
+
+# Install Rust once (official installer, from https://rust-lang.org/tools/install)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 git clone https://github.com/3wperor/e36-tuning-mac

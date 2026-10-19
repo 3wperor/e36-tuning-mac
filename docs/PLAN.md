@@ -16,6 +16,7 @@ exact variant is still unknown; `e36 ident` reads it from the car.
 | Simulator | Pretend MS41 for demo mode and tests | done (`sim.rs`) |
 | Fault decoding | Fault codes to text (`ms41/fault_codes.rs`); reply layout from a forum capture | first version done; layout **unverified** |
 | Logger | Live data block `0B 03`: gauges, chart, raw byte view, CSV export | first version done; value layout **unverified** |
+| VANOS view | On/off indicator, timeline, switch log with RPM, bit finder to locate the flag | done; flag location found per car with the finder |
 | Wideband | Read a wideband O2 controller over its own USB serial port | step 2 |
 | ECU definitions | Import the community TunerPro XDF files (tables, axes, scaling) | step 3 |
 | Map editor | 2D/3D tables, comparison against stock, undo, version history | step 3 |

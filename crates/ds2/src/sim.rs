@@ -6,10 +6,18 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use crate::frame::Frame;
-use crate::ms41::{cmd, DME_ADDRESS, LIVE_CHANNELS, LIVE_REQUEST};
+use crate::ms41::{cmd, Flag, DME_ADDRESS, LIVE_CHANNELS, LIVE_REQUEST};
 use crate::transport::Transport;
 
 const LIVE_BLOCK_LEN: usize = 32;
+
+/// Where the simulator puts its pretend VANOS flag. Not where a real MS41
+/// keeps it; that still has to be found on the car.
+pub const SIM_VANOS: Flag = Flag {
+    offset: 10,
+    bit: Some(3),
+    invert: false,
+};
 /// One byte at 9600 baud, 8E1 (11 bits).
 const BYTE_TIME: Duration = Duration::from_micros(1146);
 
@@ -48,6 +56,13 @@ impl SimulatedEcu {
         for (ch, v) in LIVE_CHANNELS.iter().zip(values) {
             ch.encode(v, &mut data);
         }
+        // Pretend VANOS: on through the mid-range.
+        if (1600.0..4200.0).contains(&rpm) {
+            data[SIM_VANOS.offset] |= 1 << SIM_VANOS.bit.unwrap_or(0);
+        }
+        // A few other status bits that flicker, so finding VANOS takes a look.
+        data[10] |= ((t * 3.0) as u8 & 1) << 6;
+        data[11] = (t * 0.5) as u8 & 0b101;
         data
     }
 
@@ -107,6 +122,10 @@ mod tests {
         let live = ms41::read_live(&mut s).unwrap();
         let rpm = LIVE_CHANNELS[0].decode(&live).unwrap();
         assert!((700.0..=4500.0).contains(&rpm), "rpm {rpm}");
+        assert_eq!(
+            SIM_VANOS.decode(&live),
+            Some((1600.0..4200.0).contains(&rpm))
+        );
 
         assert!(!ms41::read_faults(&mut s).unwrap().raw.is_empty());
         ms41::clear_faults(&mut s).unwrap();

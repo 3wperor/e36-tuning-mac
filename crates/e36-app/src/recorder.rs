@@ -5,7 +5,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use ds2::ms41::LIVE_CHANNELS;
+use ds2::ms41::{Flag, LIVE_CHANNELS};
 
 /// Which values go into a recording, one flag per entry in [`LIVE_CHANNELS`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,6 +13,8 @@ pub struct Selection {
     pub channels: Vec<bool>,
     /// The whole raw data block, needed to find values not decoded yet.
     pub raw: bool,
+    /// VANOS on/off, once its bit has been picked.
+    pub vanos: bool,
 }
 
 impl Default for Selection {
@@ -20,6 +22,7 @@ impl Default for Selection {
         Self {
             channels: vec![true; LIVE_CHANNELS.len()],
             raw: true,
+            vanos: true,
         }
     }
 }
@@ -34,6 +37,7 @@ impl Selection {
                 .map(|ch| !excluded.iter().any(|n| n == ch.name))
                 .collect(),
             raw,
+            vanos: true,
         }
     }
 
@@ -46,19 +50,24 @@ impl Selection {
             .collect()
     }
 
-    pub fn is_empty(&self) -> bool {
-        !self.raw && !self.channels.contains(&true)
+    /// True when a recording would have no columns besides time.
+    pub fn is_empty(&self, vanos_available: bool) -> bool {
+        !self.raw && !(self.vanos && vanos_available) && !self.channels.contains(&true)
     }
 
     pub fn set_all(&mut self, on: bool) {
         self.channels.fill(on);
         self.raw = on;
+        self.vanos = on;
     }
 
-    fn header(&self) -> String {
+    fn header(&self, vanos: Option<Flag>) -> String {
         let mut line = String::from("time_s");
         for (ch, _) in self.selected() {
             line += &format!(",{} ({})", ch.name, ch.unit);
+        }
+        if vanos.is_some() {
+            line += ",VANOS (on/off)";
         }
         if self.raw {
             line += ",raw_hex";
@@ -66,12 +75,19 @@ impl Selection {
         line
     }
 
-    fn row(&self, seconds: f64, data: &[u8]) -> String {
+    fn row(&self, seconds: f64, data: &[u8], vanos: Option<Flag>) -> String {
         let mut line = format!("{seconds:.3}");
         for (ch, _) in self.selected() {
             line += &match ch.decode(data) {
                 Some(v) => format!(",{v:.2}"),
                 None => ",".into(),
+            };
+        }
+        if let Some(flag) = vanos {
+            line += match flag.decode(data) {
+                Some(true) => ",1",
+                Some(false) => ",0",
+                None => ",",
             };
         }
         if self.raw {
@@ -93,6 +109,8 @@ pub struct Recorder {
     file: BufWriter<File>,
     start: Instant,
     selection: Selection,
+    /// The VANOS flag, if it's being recorded.
+    vanos: Option<Flag>,
 }
 
 impl Recorder {
@@ -105,7 +123,8 @@ impl Recorder {
             .join("e36-logs")
     }
 
-    pub fn start(selection: Selection) -> io::Result<Self> {
+    pub fn start(selection: Selection, vanos: Option<Flag>) -> io::Result<Self> {
+        let vanos = vanos.filter(|_| selection.vanos);
         let dir = Self::dir();
         fs::create_dir_all(&dir)?;
         let stamp = SystemTime::now()
@@ -114,18 +133,23 @@ impl Recorder {
             .unwrap_or_default();
         let path = dir.join(format!("log-{stamp}.csv"));
         let mut file = BufWriter::new(File::create(&path)?);
-        writeln!(file, "{}", selection.header())?;
+        writeln!(file, "{}", selection.header(vanos))?;
         Ok(Self {
             path,
             file,
             start: Instant::now(),
             selection,
+            vanos,
         })
     }
 
     pub fn write(&mut self, at: Instant, data: &[u8]) -> io::Result<()> {
         let seconds = at.saturating_duration_since(self.start).as_secs_f64();
-        writeln!(self.file, "{}", self.selection.row(seconds, data))
+        writeln!(
+            self.file,
+            "{}",
+            self.selection.row(seconds, data, self.vanos)
+        )
     }
 }
 
@@ -142,8 +166,8 @@ mod tests {
     #[test]
     fn everything_selected_by_default() {
         let sel = Selection::default();
-        assert_eq!(sel.header().split(',').count(), LIVE_CHANNELS.len() + 2);
-        assert!(sel.row(1.0, &block()).starts_with("1.000,1000.00,"));
+        assert_eq!(sel.header(None).split(',').count(), LIVE_CHANNELS.len() + 2);
+        assert!(sel.row(1.0, &block(), None).starts_with("1.000,1000.00,"));
     }
 
     #[test]
@@ -151,16 +175,16 @@ mod tests {
         let mut sel = Selection::default();
         sel.set_all(false);
         sel.channels[0] = true;
-        assert_eq!(sel.header(), "time_s,Engine speed (rpm)");
-        assert_eq!(sel.row(0.5, &block()), "0.500,1000.00");
+        assert_eq!(sel.header(None), "time_s,Engine speed (rpm)");
+        assert_eq!(sel.row(0.5, &block(), None), "0.500,1000.00");
     }
 
     #[test]
     fn raw_only() {
         let mut sel = Selection::default();
         sel.channels.fill(false);
-        assert_eq!(sel.header(), "time_s,raw_hex");
-        assert_eq!(sel.row(0.0, &[0x03, 0xE8]), "0.000,03 E8");
+        assert_eq!(sel.header(None), "time_s,raw_hex");
+        assert_eq!(sel.row(0.0, &[0x03, 0xE8], None), "0.000,03 E8");
     }
 
     #[test]
@@ -176,8 +200,31 @@ mod tests {
     fn empty_when_nothing_selected() {
         let mut sel = Selection::default();
         sel.set_all(false);
-        assert!(sel.is_empty());
+        assert!(sel.is_empty(true));
         sel.raw = true;
-        assert!(!sel.is_empty());
+        assert!(!sel.is_empty(true));
+    }
+
+    #[test]
+    fn vanos_counts_only_once_it_is_set_up() {
+        let mut sel = Selection::default();
+        sel.set_all(false);
+        sel.vanos = true;
+        assert!(sel.is_empty(false));
+        assert!(!sel.is_empty(true));
+    }
+
+    #[test]
+    fn vanos_column_written_as_one_or_zero() {
+        let mut sel = Selection::default();
+        sel.set_all(false);
+        let flag = Flag {
+            offset: 1,
+            bit: Some(0),
+            invert: false,
+        };
+        assert_eq!(sel.header(Some(flag)), "time_s,VANOS (on/off)");
+        assert_eq!(sel.row(0.0, &[0, 1], Some(flag)), "0.000,1");
+        assert_eq!(sel.row(0.0, &[0, 0], Some(flag)), "0.000,0");
     }
 }

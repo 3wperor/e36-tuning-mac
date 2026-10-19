@@ -29,7 +29,7 @@ pub mod transport;
 
 pub use frame::{checksum, Frame, FrameError, Status};
 pub use session::{EchoMode, Response, Session, SessionError, Timeouts, Trace};
-pub use sim::SimulatedEcu;
+pub use sim::{SimulatedEcu, SIM_VANOS};
 pub use transport::{MockTransport, Transport};
 
 /// Formats bytes as space-separated upper-case hex, e.g. `12 04 00 16`.

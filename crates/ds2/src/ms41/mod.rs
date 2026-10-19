@@ -224,6 +224,31 @@ pub const LIVE_CHANNELS: &[Channel] = &[
     },
 ];
 
+/// The engine speed channel, used to tag events such as VANOS switching.
+pub const ENGINE_SPEED: Channel = LIVE_CHANNELS[0];
+
+/// Where an on/off flag (such as VANOS) sits in the live data block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Flag {
+    pub offset: usize,
+    /// Bit within the byte (0 = least significant). `None` means the whole
+    /// byte, read as on when it isn't zero.
+    pub bit: Option<u8>,
+    /// Swap on and off, for flags the ECU stores the other way round.
+    pub invert: bool,
+}
+
+impl Flag {
+    pub fn decode(&self, data: &[u8]) -> Option<bool> {
+        let byte = *data.get(self.offset)?;
+        let on = match self.bit {
+            Some(n) => (byte >> n) & 1 == 1,
+            None => byte != 0,
+        };
+        Some(on != self.invert)
+    }
+}
+
 /// Reads the raw live data block (everything after the status byte).
 pub fn read_live<T: Transport>(session: &mut Session<T>) -> Result<Vec<u8>, SessionError> {
     session.request_ok(DME_ADDRESS, &LIVE_REQUEST)
@@ -311,6 +336,44 @@ mod tests {
     #[test]
     fn channel_decode_on_short_block_is_none() {
         assert_eq!(LIVE_CHANNELS[0].decode(&[0x12]), None);
+    }
+
+    #[test]
+    fn flag_reads_bits_bytes_and_inversion() {
+        let data = [0x00, 0b0000_1000];
+        let bit3 = Flag {
+            offset: 1,
+            bit: Some(3),
+            invert: false,
+        };
+        assert_eq!(bit3.decode(&data), Some(true));
+        assert_eq!(
+            Flag {
+                bit: Some(2),
+                ..bit3
+            }
+            .decode(&data),
+            Some(false)
+        );
+        assert_eq!(
+            Flag {
+                invert: true,
+                ..bit3
+            }
+            .decode(&data),
+            Some(false)
+        );
+        assert_eq!(
+            Flag {
+                offset: 0,
+                bit: None,
+                ..bit3
+            }
+            .decode(&data),
+            Some(false)
+        );
+        assert_eq!(Flag { bit: None, ..bit3 }.decode(&data), Some(true));
+        assert_eq!(Flag { offset: 5, ..bit3 }.decode(&data), None);
     }
 
     #[test]

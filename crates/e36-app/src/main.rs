@@ -1,6 +1,7 @@
 //! Live data window for the E36 MS41 DME.
 
 mod recorder;
+mod vanos;
 mod worker;
 
 use std::collections::VecDeque;
@@ -12,6 +13,7 @@ use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
 use recorder::{Recorder, Selection};
+use vanos::VanosView;
 use worker::{Command, Event, Source, Worker};
 
 /// How much history the chart keeps.
@@ -21,6 +23,8 @@ const HIGHLIGHT: Duration = Duration::from_millis(1500);
 
 const KEY_EXCLUDED: &str = "excluded_channels";
 const KEY_RECORD_RAW: &str = "record_raw";
+const KEY_RECORD_VANOS: &str = "record_vanos";
+const KEY_VANOS_SOURCE: &str = "vanos_source";
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -39,6 +43,14 @@ fn main() -> eframe::Result {
                     eframe::get_value(storage, KEY_EXCLUDED).unwrap_or_default();
                 let raw = eframe::get_value(storage, KEY_RECORD_RAW).unwrap_or(true);
                 app.selection = Selection::from_excluded(&excluded, raw);
+                app.selection.vanos = eframe::get_value(storage, KEY_RECORD_VANOS).unwrap_or(true);
+                let source: Option<(usize, Option<u8>, bool)> =
+                    eframe::get_value(storage, KEY_VANOS_SOURCE).flatten();
+                app.vanos.source = source.map(|(offset, bit, invert)| ms41::Flag {
+                    offset,
+                    bit,
+                    invert,
+                });
             }
             // `e36-app --demo` opens straight into demo mode.
             if std::env::args().any(|a| a == "--demo") {
@@ -55,6 +67,7 @@ enum Tab {
     Live,
     Raw,
     Faults,
+    Vanos,
     Recording,
 }
 
@@ -79,13 +92,15 @@ struct App {
     connected_at: Instant,
     live: Option<Vec<u8>>,
     changed_at: Vec<Instant>,
-    history: VecDeque<(Instant, Vec<Option<f64>>)>,
+    /// Raw live blocks from the last [`HISTORY`], for charts.
+    history: VecDeque<(Instant, Vec<u8>)>,
     plot_channel: usize,
 
     faults: Option<Vec<u8>>,
     confirm_clear: bool,
     recorder: Option<Recorder>,
     selection: Selection,
+    vanos: VanosView,
     tab: Tab,
 }
 
@@ -110,6 +125,7 @@ impl App {
             confirm_clear: false,
             recorder: None,
             selection: Selection::default(),
+            vanos: VanosView::new(None),
             tab: Tab::Live,
         };
         app.refresh_ports();
@@ -151,6 +167,7 @@ impl App {
         self.live_note = None;
         self.live = None;
         self.history.clear();
+        self.vanos.reset();
         self.faults = None;
     }
 
@@ -203,8 +220,8 @@ impl App {
                 self.recorder = None;
             }
         }
-        let values = LIVE_CHANNELS.iter().map(|ch| ch.decode(&data)).collect();
-        self.history.push_back((at, values));
+        self.vanos.on_live(at, self.live.as_deref(), &data);
+        self.history.push_back((at, data.clone()));
         while self
             .history
             .front()
@@ -281,7 +298,7 @@ impl App {
                     }
                 } else if ui
                     .add_enabled(
-                        connected && !self.selection.is_empty(),
+                        connected && !self.selection.is_empty(self.vanos.source.is_some()),
                         egui::Button::new("Record CSV"),
                     )
                     .on_disabled_hover_text(if connected {
@@ -291,7 +308,7 @@ impl App {
                     })
                     .clicked()
                 {
-                    match Recorder::start(self.selection.clone()) {
+                    match Recorder::start(self.selection.clone(), self.vanos.source) {
                         Ok(r) => {
                             self.status = Some(format!("Recording to {}", r.path.display()));
                             self.recorder = Some(r);
@@ -351,7 +368,12 @@ impl App {
         let points: PlotPoints = self
             .history
             .iter()
-            .filter_map(|(t, vals)| Some([t.duration_since(start).as_secs_f64(), vals[idx]?]))
+            .filter_map(|(t, data)| {
+                Some([
+                    t.duration_since(start).as_secs_f64(),
+                    LIVE_CHANNELS[idx].decode(data)?,
+                ])
+            })
             .collect();
         let ch = &LIVE_CHANNELS[idx];
         Plot::new("history")
@@ -419,6 +441,12 @@ impl App {
             for (ch, on) in LIVE_CHANNELS.iter().zip(&mut self.selection.channels) {
                 ui.checkbox(on, format!("{} ({})", ch.name, ch.unit));
             }
+            let vanos_ready = self.vanos.source.is_some();
+            ui.add_enabled(
+                vanos_ready,
+                egui::Checkbox::new(&mut self.selection.vanos, "VANOS (on/off)"),
+            )
+            .on_disabled_hover_text("Pick the VANOS bit in the VANOS tab first");
             ui.checkbox(&mut self.selection.raw, "Raw data block (all bytes)")
                 .on_hover_text(
                     "Every byte the ECU sends. Keep this on for now: it's how we find \
@@ -542,6 +570,9 @@ impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, KEY_EXCLUDED, &self.selection.excluded());
         eframe::set_value(storage, KEY_RECORD_RAW, &self.selection.raw);
+        eframe::set_value(storage, KEY_RECORD_VANOS, &self.selection.vanos);
+        let source = self.vanos.source.map(|f| (f.offset, f.bit, f.invert));
+        eframe::set_value(storage, KEY_VANOS_SOURCE, &source);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -576,15 +607,23 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.tab, Tab::Live, "Live");
                 ui.selectable_value(&mut self.tab, Tab::Raw, "Raw bytes");
                 ui.selectable_value(&mut self.tab, Tab::Faults, "Faults");
+                ui.selectable_value(&mut self.tab, Tab::Vanos, "VANOS");
                 ui.selectable_value(&mut self.tab, Tab::Recording, "Recording");
             });
             ui.separator();
-            match self.tab {
+            egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
                 Tab::Live => self.live_tab(ui),
                 Tab::Raw => self.raw_tab(ui),
                 Tab::Faults => self.faults_tab(ui),
+                Tab::Vanos => self.vanos.ui(
+                    ui,
+                    &self.history,
+                    self.connected_at,
+                    self.live.as_deref(),
+                    self.demo,
+                ),
                 Tab::Recording => self.recording_tab(ui),
-            }
+            });
         });
 
         if self.conn == Conn::Connected {

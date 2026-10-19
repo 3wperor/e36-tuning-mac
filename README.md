@@ -41,6 +41,10 @@ cargo run --release -p e36-app -- --demo  # try it with a simulated ECU, no cabl
 - **Faults**: read the stored fault codes with plain-English descriptions,
   and clear them with a confirmation step. The raw bytes are always shown
   too, because the reply layout is still unverified for your ECU.
+- **VANOS**: big ON/OFF indicator, a timeline against engine speed, and a
+  log of every switch with the RPM it happened at. The first time, use the
+  bit finder in the same tab: drive or rev so VANOS switches, spot the bit
+  that flips each time, and click it. The app remembers it.
 - **Recording**: tick the values you want in your logs. The app remembers
   your choice.
 - **Record CSV** saves a log to `~/Documents/e36-logs/`. It opens in Numbers,

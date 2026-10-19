@@ -10,7 +10,8 @@ exact variant is still unknown; `e36 ident` reads it from the car.
 
 | Layer | What it does | Status |
 |---|---|---|
-| Transport | USB serial at 9600 baud, 8E1, handling of the K-line echo, timeouts | done (`crates/ds2/src/serial.rs`, `session.rs`) |
+| Transport | USB serial at 9600 baud, 8E1, handling of the K-line echo, timeouts, line draining after bad frames | done (`crates/ds2/src/serial.rs`, `session.rs`) |
+| Live polling | Self-adjusting request pacing for a running engine; errors retried; app reconnects by itself | done (`poll.rs`); tested against a simulated busy, noisy ECU |
 | DS2 protocol | `[addr][len][payload][xor]` frames; the DME is at address `0x12` | done (`frame.rs`) |
 | Diagnostics | ECU identity, read and clear fault codes | done (`ms41/mod.rs`) |
 | Simulator | Pretend MS41 for demo mode and tests | done (`sim.rs`) |

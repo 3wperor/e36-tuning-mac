@@ -3,9 +3,13 @@
 //! The K-line is a single wire, so most cables hand back every byte we send
 //! (the "echo") before the ECU's reply arrives. [`EchoMode::Auto`] copes with
 //! cables that do and don't echo.
+//!
+//! A running engine makes the line noisy and the ECU busier, so the session
+//! leaves a gap between exchanges and, after a bad frame, waits for the line
+//! to go quiet before the next request.
 
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -14,7 +18,8 @@ use crate::transport::Transport;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EchoMode {
-    /// Discard the echo if it shows up, otherwise treat the bytes as the reply.
+    /// Work out from the first good exchange whether the cable echoes, then
+    /// stick with that (so a noisy echo byte can't be mistaken for the reply).
     Auto,
     /// The cable always echoes; anything else is an error.
     Expect,
@@ -35,7 +40,7 @@ impl Default for Timeouts {
         // One byte at 9600 8E1 takes ~1.1 ms; the slack covers USB adapter
         // latency (FTDI defaults to 16 ms) and slow ECU responses.
         Self {
-            first_byte: Duration::from_millis(1000),
+            first_byte: Duration::from_millis(500),
             inter_byte: Duration::from_millis(100),
         }
     }
@@ -47,7 +52,16 @@ pub enum Trace<'a> {
     Tx(&'a [u8]),
     Echo(&'a [u8]),
     Rx(&'a [u8]),
+    /// Stray bytes thrown away while waiting for the line to go quiet.
+    Discard(&'a [u8]),
 }
+
+/// Default pause between the end of one exchange and the next request.
+pub const DEFAULT_GAP: Duration = Duration::from_millis(20);
+/// The line counts as quiet after this long without a byte.
+const IDLE: Duration = Duration::from_millis(30);
+/// Never spend longer than this waiting for the line to go quiet.
+const MAX_DRAIN: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -81,7 +95,11 @@ type TraceFn = Box<dyn FnMut(Trace<'_>)>;
 pub struct Session<T: Transport> {
     transport: T,
     echo: EchoMode,
+    /// In `Auto` mode: whether the cable echoes, once known.
+    echo_seen: Option<bool>,
     timeouts: Timeouts,
+    gap: Duration,
+    last_done: Option<Instant>,
     trace: Option<TraceFn>,
 }
 
@@ -90,7 +108,10 @@ impl<T: Transport> Session<T> {
         Self {
             transport,
             echo: EchoMode::Auto,
+            echo_seen: None,
             timeouts: Timeouts::default(),
+            gap: DEFAULT_GAP,
+            last_done: None,
             trace: None,
         }
     }
@@ -110,35 +131,83 @@ impl<T: Transport> Session<T> {
         self
     }
 
+    pub fn with_gap(mut self, gap: Duration) -> Self {
+        self.gap = gap;
+        self
+    }
+
+    /// Changes the pause between exchanges.
+    pub fn set_gap(&mut self, gap: Duration) {
+        self.gap = gap;
+    }
+
     pub fn transport(&self) -> &T {
         &self.transport
     }
 
     /// Sends one request and returns the reply, whatever its status.
+    ///
+    /// After any failure other than a dead port, waits for the line to go
+    /// quiet so leftovers of a mangled reply can't spoil the next exchange.
     pub fn request(&mut self, address: u8, payload: &[u8]) -> Result<Response, SessionError> {
+        if let Some(done) = self.last_done {
+            let since = done.elapsed();
+            if since < self.gap {
+                std::thread::sleep(self.gap - since);
+            }
+        }
+        let result = self.exchange(address, payload);
+        if let Err(e) = &result {
+            if !matches!(e, SessionError::Io(_)) {
+                self.drain()?;
+            }
+        }
+        self.last_done = Some(Instant::now());
+        result
+    }
+
+    fn exchange(&mut self, address: u8, payload: &[u8]) -> Result<Response, SessionError> {
         let tx = Frame::new(address, payload)?.encode();
         self.transport.clear_input()?;
         self.transport.write_all(&tx)?;
         self.emit(Trace::Tx(&tx));
 
+        let echo = match self.echo {
+            EchoMode::Off => Some(false),
+            EchoMode::Expect => Some(true),
+            EchoMode::Auto => self.echo_seen,
+        };
         let mut rx = Vec::new();
-        if self.echo != EchoMode::Off {
-            // Read while the bytes still match what we sent, so a reply that is
-            // shorter than the request is never over-read.
-            while rx.len() < tx.len() && tx.starts_with(&rx) {
-                let want = rx.len() + 1;
-                self.read_into(&mut rx, want)?;
-            }
-            if rx == tx {
+        let mut echoed = false;
+        match echo {
+            Some(false) => {}
+            Some(true) => {
+                // Drop exactly the echo, even if noise changed a byte of it.
+                self.read_into(&mut rx, tx.len())?;
+                if rx != tx && self.echo == EchoMode::Expect {
+                    return Err(SessionError::EchoMismatch {
+                        sent: crate::hex(&tx),
+                        received: crate::hex(&rx),
+                    });
+                }
                 self.emit(Trace::Echo(&rx));
                 rx.clear();
-            } else if self.echo == EchoMode::Expect {
-                return Err(SessionError::EchoMismatch {
-                    sent: crate::hex(&tx),
-                    received: crate::hex(&rx),
-                });
+                echoed = true;
             }
-            // Auto: what we read was the start of the reply, keep it.
+            None => {
+                // Not known yet. Read while the bytes still match what we
+                // sent, so a reply shorter than the request is never over-read.
+                while rx.len() < tx.len() && tx.starts_with(&rx) {
+                    let want = rx.len() + 1;
+                    self.read_into(&mut rx, want)?;
+                }
+                if rx == tx {
+                    self.emit(Trace::Echo(&rx));
+                    rx.clear();
+                    echoed = true;
+                }
+                // Otherwise what we read was the start of the reply; keep it.
+            }
         }
 
         self.read_into(&mut rx, 2)?;
@@ -161,6 +230,9 @@ impl<T: Transport> Session<T> {
             .payload
             .split_first()
             .ok_or(SessionError::EmptyResponse)?;
+        if self.echo == EchoMode::Auto && self.echo_seen.is_none() {
+            self.echo_seen = Some(echoed);
+        }
         Ok(Response {
             status: status.into(),
             data: data.to_vec(),
@@ -174,6 +246,23 @@ impl<T: Transport> Session<T> {
             return Err(SessionError::Negative(resp.status));
         }
         Ok(resp.data)
+    }
+
+    /// Throws bytes away until the line has been quiet for [`IDLE`].
+    fn drain(&mut self) -> Result<(), SessionError> {
+        let start = Instant::now();
+        let mut junk = Vec::new();
+        while start.elapsed() < MAX_DRAIN {
+            match self.transport.read_byte(IDLE)? {
+                Some(b) => junk.push(b),
+                None => break,
+            }
+        }
+        if !junk.is_empty() {
+            self.emit(Trace::Discard(&junk));
+        }
+        self.transport.clear_input()?;
+        Ok(())
     }
 
     /// Reads until `buf` holds `len` bytes. Bytes already in `buf` count.
@@ -319,6 +408,56 @@ mod tests {
     }
 
     #[test]
+    fn waits_the_gap_between_exchanges() {
+        let mock = MockTransport::new(true)
+            .expect(IDENT_REQ, reply(&[0xA0]))
+            .expect(IDENT_REQ, reply(&[0xA0]));
+        let mut s = Session::new(mock).with_gap(Duration::from_millis(40));
+        s.request(0x12, &[0x00]).unwrap();
+        let t = Instant::now();
+        s.request(0x12, &[0x00]).unwrap();
+        assert!(t.elapsed() >= Duration::from_millis(35));
+    }
+
+    #[test]
+    fn remembers_echo_and_survives_a_corrupted_echo_byte() {
+        // Cable echo simulated in the scripted bytes so it can be corrupted.
+        let mut bad_echo = IDENT_REQ.to_vec();
+        bad_echo[2] = 0x40;
+        let mock = MockTransport::new(false)
+            .expect(IDENT_REQ, [IDENT_REQ.to_vec(), reply(&[0xA0, 1])].concat())
+            .expect(IDENT_REQ, [bad_echo, reply(&[0xA0, 2])].concat());
+        let mut s = Session::new(mock).with_gap(Duration::ZERO);
+        assert_eq!(s.request(0x12, &[0x00]).unwrap().data, vec![1]);
+        assert_eq!(s.request(0x12, &[0x00]).unwrap().data, vec![2]);
+    }
+
+    #[test]
+    fn drains_leftovers_after_a_bad_frame() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut bad = reply(&[0xA0, 0x31]);
+        *bad.last_mut().unwrap() ^= 0xFF;
+        bad.extend([0xEE, 0xEE]);
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let sink = log.clone();
+        let mock = MockTransport::new(true)
+            .expect(IDENT_REQ, bad)
+            .expect(IDENT_REQ, reply(&[0xA0]));
+        let mut s = Session::new(mock)
+            .with_gap(Duration::ZERO)
+            .with_trace(move |t| {
+                if let Trace::Discard(b) = t {
+                    sink.borrow_mut().push(b.to_vec());
+                }
+            });
+        assert!(s.request(0x12, &[0x00]).is_err());
+        assert_eq!(*log.borrow(), vec![vec![0xEE, 0xEE]]);
+        assert!(s.request(0x12, &[0x00]).is_ok());
+    }
+
+    #[test]
     fn trace_sees_tx_echo_and_rx() {
         use std::cell::RefCell;
         use std::rc::Rc;
@@ -332,6 +471,7 @@ mod tests {
                     Trace::Tx(b) => format!("tx {}", crate::hex(b)),
                     Trace::Echo(b) => format!("echo {}", crate::hex(b)),
                     Trace::Rx(b) => format!("rx {}", crate::hex(b)),
+                    Trace::Discard(b) => format!("discard {}", crate::hex(b)),
                 })
             })
             .request(0x12, &[0x00])

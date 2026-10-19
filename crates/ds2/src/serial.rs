@@ -57,11 +57,22 @@ impl Transport for SerialTransport {
             self.timeout = timeout;
         }
         let mut b = [0u8; 1];
-        match self.port.read(&mut b) {
-            Ok(1) => Ok(Some(b[0])),
-            Ok(_) => Ok(None),
-            Err(e) if e.kind() == io::ErrorKind::TimedOut => Ok(None),
-            Err(e) => Err(e),
+        loop {
+            return match self.port.read(&mut b) {
+                Ok(1) => Ok(Some(b[0])),
+                Ok(_) => Ok(None),
+                // macOS can interrupt a blocking read; that isn't a dead cable.
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    Ok(None)
+                }
+                Err(e) => Err(e),
+            };
         }
     }
 

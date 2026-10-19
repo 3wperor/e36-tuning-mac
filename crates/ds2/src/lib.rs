@@ -16,11 +16,13 @@
 //! - [`transport`]: the byte-pipe abstraction plus a scripted mock for tests
 //! - [`session`]: request/response handling, K-line echo, timeouts
 //! - [`ms41`]: commands for the Siemens MS41 DME (M52/S52 engines)
+//! - [`poll`]: self-pacing live data polling for a running engine
 //! - [`sim`]: a simulated MS41 for demo mode and tests
 //! - `serial` (feature `serial`): the real USB cable
 
 pub mod frame;
 pub mod ms41;
+pub mod poll;
 #[cfg(feature = "serial")]
 pub mod serial;
 pub mod session;
@@ -28,6 +30,7 @@ pub mod sim;
 pub mod transport;
 
 pub use frame::{checksum, Frame, FrameError, Status};
+pub use poll::{LinkStats, LivePoller, Pacing};
 pub use session::{EchoMode, Response, Session, SessionError, Timeouts, Trace};
 pub use sim::{SimulatedEcu, SIM_VANOS};
 pub use transport::{MockTransport, Transport};

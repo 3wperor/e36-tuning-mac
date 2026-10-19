@@ -25,6 +25,13 @@ pub struct SimulatedEcu {
     start: Instant,
     rx: VecDeque<u8>,
     faults: Vec<u8>,
+    /// Random state for noise; `None` means a perfect line.
+    noise: Option<u32>,
+    /// Sleep for as long as the real wire would take.
+    realtime: bool,
+    /// Answer busy to requests that come sooner than this after the last one.
+    needs_gap: Option<Duration>,
+    last_request: Option<Instant>,
 }
 
 impl Default for SimulatedEcu {
@@ -44,7 +51,40 @@ impl SimulatedEcu {
                 0x02, 10, 0x21, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 57, 0x11, 0x01, 0x00, 0x00,
                 0x00, 0x00, 0x00,
             ],
+            noise: None,
+            realtime: true,
+            needs_gap: None,
+            last_request: None,
         }
+    }
+
+    /// Like an ECU busy running the engine: answers busy when requests come
+    /// faster than `gap` apart.
+    pub fn needs_gap(mut self, gap: Duration) -> Self {
+        self.needs_gap = Some(gap);
+        self
+    }
+
+    /// Behaves like a running engine on a noisy line: some replies come back
+    /// busy, corrupted, cut short, preceded by junk, or not at all.
+    pub fn noisy(mut self, seed: u32) -> Self {
+        self.noise = Some(seed.max(1));
+        self
+    }
+
+    /// Answers instantly instead of at 9600-baud speed (for tests).
+    pub fn fast(mut self) -> Self {
+        self.realtime = false;
+        self
+    }
+
+    /// Percentage roll, 0..100 (xorshift32).
+    fn roll(&mut self) -> Option<u32> {
+        let x = self.noise.as_mut()?;
+        *x ^= *x << 13;
+        *x ^= *x >> 17;
+        *x ^= *x << 5;
+        Some(*x % 100)
     }
 
     fn live_block(&self) -> Vec<u8> {
@@ -85,15 +125,40 @@ impl Transport for SimulatedEcu {
         // Like a real K-line, everything sent comes back first.
         self.rx.extend(bytes);
         if let Ok(req) = Frame::decode(bytes) {
-            if req.address == DME_ADDRESS {
+            let too_soon = self
+                .needs_gap
+                .zip(self.last_request)
+                .is_some_and(|(gap, last)| last.elapsed() < gap);
+            self.last_request = Some(Instant::now());
+            if req.address == DME_ADDRESS && too_soon {
+                let busy = Frame::new(DME_ADDRESS, vec![0xA1]).unwrap().encode();
+                self.rx.extend(busy);
+            } else if req.address == DME_ADDRESS {
                 let reply = self.reply_to(&req.payload);
-                let frame = Frame::new(DME_ADDRESS, reply).expect("reply fits in a frame");
-                self.rx.extend(frame.encode());
+                let mut frame = Frame::new(DME_ADDRESS, reply)
+                    .expect("reply fits in a frame")
+                    .encode();
+                match self.roll() {
+                    Some(0..8) => {
+                        frame = Frame::new(DME_ADDRESS, vec![0xA1]).unwrap().encode();
+                    }
+                    Some(r @ 8..14) => {
+                        let i = r as usize % frame.len();
+                        frame[i] ^= 0x5A;
+                    }
+                    Some(14..18) => frame.clear(),
+                    Some(18..22) => frame.truncate(frame.len() / 2),
+                    Some(22..25) => frame.insert(0, 0xFF),
+                    _ => {}
+                }
+                self.rx.extend(frame);
             }
         }
-        // Take as long as the real wire would, so demo mode polls at a
-        // realistic rate instead of spinning.
-        std::thread::sleep(BYTE_TIME * self.rx.len() as u32);
+        if self.realtime {
+            // Take as long as the real wire would, so demo mode polls at a
+            // realistic rate instead of spinning.
+            std::thread::sleep(BYTE_TIME * self.rx.len() as u32);
+        }
         Ok(())
     }
 
@@ -115,7 +180,7 @@ mod tests {
 
     #[test]
     fn answers_ident_live_and_faults() {
-        let mut s = Session::new(SimulatedEcu::new());
+        let mut s = Session::new(SimulatedEcu::new().fast());
         let id = ms41::ident(&mut s).unwrap();
         assert_eq!(id.part_number.as_deref(), Some("1429861"));
 

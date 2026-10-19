@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use ds2::ms41::{self, LIVE_CHANNELS};
 use ds2::serial::available_ports;
+use ds2::LinkStats;
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
@@ -53,6 +54,9 @@ fn main() -> eframe::Result {
                 });
             }
             // `e36-app --demo` opens straight into demo mode.
+            // `--noisy` makes the demo ECU behave like a running engine on a
+            // noisy line, to see the link recover.
+            app.noisy = std::env::args().any(|a| a == "--noisy");
             if std::env::args().any(|a| a == "--demo") {
                 app.demo = true;
                 app.autoconnect = true;
@@ -76,16 +80,20 @@ enum Conn {
     Disconnected,
     Connecting,
     Connected,
+    /// Was connected, lost the link, trying to get it back.
+    Reconnecting,
 }
 
 struct App {
     ports: Vec<String>,
     port: Option<String>,
     demo: bool,
+    noisy: bool,
     autoconnect: bool,
     worker: Option<Worker>,
     conn: Conn,
     ident: Option<ms41::Ident>,
+    link: Option<LinkStats>,
     status: Option<String>,
     live_note: Option<String>,
 
@@ -110,10 +118,12 @@ impl App {
             ports: Vec::new(),
             port: None,
             demo: false,
+            noisy: false,
             autoconnect: false,
             worker: None,
             conn: Conn::Disconnected,
             ident: None,
+            link: None,
             status: None,
             live_note: None,
             connected_at: Instant::now(),
@@ -153,7 +163,7 @@ impl App {
 
     fn connect(&mut self, ctx: &egui::Context) {
         let source = if self.demo {
-            Source::Demo
+            Source::Demo { noisy: self.noisy }
         } else if let Some(p) = &self.port {
             Source::Cable(p.clone())
         } else {
@@ -175,14 +185,26 @@ impl App {
         self.worker = None; // dropping it tells the thread to stop
         self.conn = Conn::Disconnected;
         self.recorder = None;
+        self.link = None;
     }
 
     fn handle(&mut self, event: Event) {
         match event {
             Event::Connected(id) => {
+                match self.conn {
+                    // Keep the chart's time axis running across a reconnect.
+                    Conn::Reconnecting => self.status = Some("Reconnected.".into()),
+                    _ => self.connected_at = Instant::now(),
+                }
                 self.conn = Conn::Connected;
-                self.connected_at = Instant::now();
                 self.ident = Some(id);
+            }
+            Event::Link(stats) => self.link = Some(stats),
+            Event::Reconnecting(reason) => {
+                self.conn = Conn::Reconnecting;
+                self.status = Some(format!(
+                    "Link lost, reconnecting… ({reason}). Recording carries on once it's back."
+                ));
             }
             Event::Live(at, data) => self.on_live(at, data),
             Event::LiveUnsupported(msg) => self.live_note = Some(msg),
@@ -285,6 +307,16 @@ impl App {
                         .and_then(|i| i.part_number_pretty())
                         .unwrap_or_else(|| "unknown".into());
                     ui.label(format!("DME {pn}  ·  {:.1} reads/s", self.rate()));
+                    if let Some(link) = &self.link {
+                        link_label(ui, link);
+                    }
+                }
+                Conn::Reconnecting => {
+                    if ui.button("Disconnect").clicked() {
+                        self.disconnect();
+                    }
+                    ui.spinner();
+                    ui.colored_label(egui::Color32::YELLOW, "Reconnecting…");
                 }
             }
 
@@ -600,6 +632,7 @@ impl eframe::App for App {
                 }
                 Conn::Connecting => "Asking the DME who it is…",
                 Conn::Connected => "Connected.",
+                Conn::Reconnecting => "Reconnecting…",
             }));
         });
         egui::CentralPanel::default().show(ui, |ui| {
@@ -626,9 +659,32 @@ impl eframe::App for App {
             });
         });
 
-        if self.conn == Conn::Connected {
+        if matches!(self.conn, Conn::Connected | Conn::Reconnecting) {
             // Keep the byte highlights fading even between reads.
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
     }
+}
+
+/// "link 97%" in green, yellow or red, with the details on hover.
+fn link_label(ui: &mut egui::Ui, link: &LinkStats) {
+    let quality = link.quality();
+    let color = if quality >= 0.9 {
+        egui::Color32::from_rgb(60, 180, 90)
+    } else if quality >= 0.6 {
+        egui::Color32::YELLOW
+    } else {
+        egui::Color32::from_rgb(230, 80, 60)
+    };
+    let mut details = format!(
+        "Good replies: {}\nFailed: {}\nPause between requests: {} ms (adjusts itself)",
+        link.good,
+        link.failed,
+        link.gap.as_millis()
+    );
+    if let Some(e) = &link.last_error {
+        details += &format!("\nLast problem: {e}");
+    }
+    ui.colored_label(color, format!("·  link {:.0}%", quality * 100.0))
+        .on_hover_text(details);
 }

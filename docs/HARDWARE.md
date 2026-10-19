@@ -39,6 +39,34 @@ cable's K-line.
 | `echo mismatch` or garbage | Run again with `--echo off`, then with `--dtr low` or `--dtr high`. Some cables use DTR to select K-line mode. |
 | Still stuck | Run with `--trace` and save the output. Those bytes tell us exactly what's happening. |
 
+## Logging with the engine running
+
+A running engine keeps the ECU busier and puts electrical noise on the line.
+The tools deal with this themselves:
+
+- **They pace their requests.** The pause between requests adjusts itself:
+  it grows when the ECU answers "busy" or doesn't answer, and shrinks again
+  when replies come back cleanly. Expect roughly 6–13 readings a second
+  depending on how busy the ECU is.
+- **Errors are retried, not fatal.** A corrupted reply is thrown away, the
+  line is left to go quiet, and the next request goes out.
+- **The app reconnects on its own** if the link really drops (cable pulled,
+  or several seconds without a good reply), and a running recording carries
+  on once it's back.
+
+The **link %** next to the read rate in the app shows the share of good
+replies; hover over it for details. If it stays low (below about 80%) with
+the engine running, the line is noisier than it should be. Try:
+
+- running the Mac on battery rather than from an in-car inverter or charger,
+  which can create a ground loop
+- plugging the cable straight into the Mac, not through a USB hub
+- a clip-on ferrite on the USB cable near the K+DCAN end
+- checking that the 20-pin adapter is fully seated with its collar tightened
+
+`e36 live --trace` prints every byte, including noise that was thrown away,
+which shows exactly what the line is doing.
+
 ## Adding a wideband O2 sensor
 
 A wideband kit is a sensor, a controller and usually a gauge. Fitted like this,

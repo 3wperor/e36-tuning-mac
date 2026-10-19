@@ -1,18 +1,30 @@
 //! Background thread that owns the ECU connection, so the window never
 //! freezes while waiting on the 9600-baud K-line.
+//!
+//! Once connected it keeps going: live reads are paced by [`LivePoller`],
+//! failures are retried, and if the link really goes (cable pulled, or no
+//! good reply for a while) it reopens the port and carries on.
 
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use ds2::serial::{LineOptions, SerialTransport};
-use ds2::{ms41, Session, SessionError, SimulatedEcu, Transport};
+use ds2::{ms41, LinkStats, LivePoller, Pacing, Session, SessionError, SimulatedEcu, Transport};
 
-/// Give up after this many failed live reads in a row.
-const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+/// Reopen the port after this many failed live reads in a row. With the
+/// poller backing off, that's several seconds without a single good reply.
+const RECONNECT_AFTER: u32 = 15;
+/// Pause before trying to reconnect.
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+/// How often link stats are sent to the UI.
+const STATS_EVERY: Duration = Duration::from_millis(500);
+/// Attempts at reading the ident before a connection counts as failed.
+const IDENT_ATTEMPTS: u32 = 3;
 
+#[derive(Clone)]
 pub enum Source {
-    Demo,
+    Demo { noisy: bool },
     Cable(String),
 }
 
@@ -26,6 +38,8 @@ pub enum Event {
     Connected(ms41::Ident),
     Live(Instant, Vec<u8>),
     LiveUnsupported(String),
+    Link(LinkStats),
+    Reconnecting(String),
     Faults(Vec<u8>),
     FaultsCleared,
     Error(String),
@@ -67,56 +81,203 @@ impl Drop for Worker {
     }
 }
 
+/// Why the polling loop stopped.
+enum Exit {
+    Quit,
+    Reconnect(String),
+}
+
+type Opener<'a> = dyn Fn() -> Result<Box<dyn Transport>, String> + 'a;
+
 fn run(source: Source, commands: &Receiver<Command>, send: &dyn Fn(Event)) -> Result<(), String> {
-    let transport: Box<dyn Transport> = match source {
-        Source::Demo => Box::new(SimulatedEcu::new()),
+    run_with(&|| open(&source), commands, send, RECONNECT_DELAY)
+}
+
+fn open(source: &Source) -> Result<Box<dyn Transport>, String> {
+    Ok(match source {
+        Source::Demo { noisy: false } => Box::new(SimulatedEcu::new()),
+        Source::Demo { noisy: true } => Box::new(
+            SimulatedEcu::new()
+                .noisy(0x5eed)
+                .needs_gap(Duration::from_millis(60)),
+        ),
         Source::Cable(path) => Box::new(
-            SerialTransport::open(&path, LineOptions::default())
+            SerialTransport::open(path, LineOptions::default())
                 .map_err(|e| format!("could not open {path}: {e}"))?,
         ),
-    };
-    let mut session = Session::new(transport);
-    let ident = ms41::ident(&mut session).map_err(|e| e.to_string())?;
-    send(Event::Connected(ident));
+    })
+}
 
-    let mut live_supported = true;
-    let mut errors = 0;
+/// Runs until the user disconnects. Only a failure to connect the very first
+/// time is reported as an error; after that it keeps reconnecting.
+fn run_with(
+    open: &Opener<'_>,
+    commands: &Receiver<Command>,
+    send: &dyn Fn(Event),
+    reconnect_delay: Duration,
+) -> Result<(), String> {
+    let mut session = connect(open, send)?;
+    loop {
+        match poll_loop(&mut session, commands, send) {
+            Exit::Quit => return Ok(()),
+            Exit::Reconnect(reason) => {
+                drop(session); // close the port before reopening it
+                send(Event::Reconnecting(reason));
+                loop {
+                    if wait_or_quit(commands, reconnect_delay) {
+                        return Ok(());
+                    }
+                    match connect(open, send) {
+                        Ok(s) => {
+                            session = s;
+                            break;
+                        }
+                        Err(e) => send(Event::Reconnecting(e)),
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn connect(open: &Opener<'_>, send: &dyn Fn(Event)) -> Result<Session<Box<dyn Transport>>, String> {
+    let mut session = Session::new(open()?);
+    let mut last_err = None;
+    for _ in 0..IDENT_ATTEMPTS {
+        match ms41::ident(&mut session) {
+            Ok(ident) => {
+                send(Event::Connected(ident));
+                return Ok(session);
+            }
+            Err(e @ SessionError::Io(_)) => return Err(e.to_string()),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.map_or_else(String::new, |e| e.to_string()))
+}
+
+fn poll_loop(
+    session: &mut Session<Box<dyn Transport>>,
+    commands: &Receiver<Command>,
+    send: &dyn Fn(Event),
+) -> Exit {
+    let mut poller = LivePoller::new(Pacing::default());
+    let mut live_paused = false;
+    let mut last_stats = Instant::now();
     loop {
         match commands.try_recv() {
-            Ok(Command::Disconnect) | Err(TryRecvError::Disconnected) => return Ok(()),
-            Ok(Command::ReadFaults) => send(match ms41::read_faults(&mut session) {
+            Ok(Command::Disconnect) | Err(TryRecvError::Disconnected) => return Exit::Quit,
+            Ok(Command::ReadFaults) => send(match ms41::read_faults(session) {
                 Ok(f) => Event::Faults(f.raw),
                 Err(e) => Event::Error(format!("reading faults: {e}")),
             }),
-            Ok(Command::ClearFaults) => send(match ms41::clear_faults(&mut session) {
+            Ok(Command::ClearFaults) => send(match ms41::clear_faults(session) {
                 Ok(()) => Event::FaultsCleared,
                 Err(e) => Event::Error(format!("clearing faults: {e}")),
             }),
             Err(TryRecvError::Empty) => {}
         }
 
-        if !live_supported {
+        if live_paused {
             thread::sleep(Duration::from_millis(100));
             continue;
         }
-        match ms41::read_live(&mut session) {
-            Ok(data) => {
-                errors = 0;
-                send(Event::Live(Instant::now(), data));
-            }
-            Err(SessionError::Negative(status)) => {
-                live_supported = false;
-                send(Event::LiveUnsupported(format!(
-                    "the ECU answered {status} to the live data request"
-                )));
-            }
+        match poller.poll(session) {
+            Ok(data) => send(Event::Live(Instant::now(), data)),
+            Err(SessionError::Io(e)) => return Exit::Reconnect(format!("cable problem: {e}")),
             Err(e) => {
-                errors += 1;
-                if errors >= MAX_CONSECUTIVE_ERRORS {
-                    return Err(format!("lost connection: {e}"));
+                if poller.looks_unsupported() {
+                    live_paused = true;
+                    send(Event::LiveUnsupported(e.to_string()));
+                } else if poller.stats().consecutive_failures >= RECONNECT_AFTER {
+                    return Exit::Reconnect(format!("no good replies for a while ({e})"));
                 }
-                send(Event::Error(e.to_string()));
             }
         }
+        if last_stats.elapsed() >= STATS_EVERY {
+            last_stats = Instant::now();
+            send(Event::Link(poller.stats().clone()));
+        }
+    }
+}
+
+/// Sleeps for `delay`, returning early with `true` if the user disconnects.
+fn wait_or_quit(commands: &Receiver<Command>, delay: Duration) -> bool {
+    match commands.recv_timeout(delay) {
+        Ok(Command::Disconnect) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
+        Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::io;
+
+    /// A simulated ECU whose cable "unplugs" after a number of writes.
+    struct Unplugs {
+        ecu: SimulatedEcu,
+        writes_left: u32,
+    }
+
+    impl Transport for Unplugs {
+        fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+            if self.writes_left == 0 {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "device gone"));
+            }
+            self.writes_left -= 1;
+            self.ecu.write_all(bytes)
+        }
+        fn read_byte(&mut self, t: Duration) -> io::Result<Option<u8>> {
+            self.ecu.read_byte(t)
+        }
+        fn clear_input(&mut self) -> io::Result<()> {
+            self.ecu.clear_input()
+        }
+    }
+
+    #[test]
+    fn reconnects_after_the_cable_drops_and_keeps_streaming() {
+        let opened = Cell::new(0);
+        let open = || -> Result<Box<dyn Transport>, String> {
+            opened.set(opened.get() + 1);
+            Ok(Box::new(Unplugs {
+                ecu: SimulatedEcu::new().fast(),
+                writes_left: 6,
+            }))
+        };
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let events = RefCell::new(Vec::new());
+        let live = Cell::new(0);
+        let send = |e: Event| {
+            if let Event::Live(..) = e {
+                live.set(live.get() + 1);
+                // Stop once data has flowed across a couple of reconnects.
+                if live.get() == 12 {
+                    let _ = cmd_tx.send(Command::Disconnect);
+                }
+            }
+            events.borrow_mut().push(match e {
+                Event::Connected(_) => "connected",
+                Event::Reconnecting(_) => "reconnecting",
+                _ => "other",
+            });
+        };
+        let result = run_with(&open, &cmd_rx, &send, Duration::from_millis(1));
+        assert!(result.is_ok());
+        assert_eq!(live.get(), 12);
+        assert!(opened.get() >= 3, "opened {} times", opened.get());
+        let events = events.borrow();
+        assert!(events.iter().filter(|e| **e == "reconnecting").count() >= 2);
+        assert!(events.iter().filter(|e| **e == "connected").count() >= 3);
+    }
+
+    #[test]
+    fn first_connection_failure_is_reported() {
+        let open = || -> Result<Box<dyn Transport>, String> { Err("no such port".into()) };
+        let (_tx, rx) = mpsc::channel();
+        let err = run_with(&open, &rx, &|_| {}, Duration::from_millis(1)).unwrap_err();
+        assert_eq!(err, "no such port");
     }
 }

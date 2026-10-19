@@ -3,7 +3,7 @@ use std::io::{self, BufRead, Write};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use ds2::serial::{available_ports, LineOptions, SerialPortType, SerialTransport};
-use ds2::{hex, ms41, EchoMode, Session, SimulatedEcu, Trace, Transport};
+use ds2::{hex, ms41, EchoMode, LivePoller, Pacing, Session, SimulatedEcu, Trace, Transport};
 
 /// Diagnostics for the BMW E36 Siemens MS41 DME over a K+DCAN cable.
 ///
@@ -37,6 +37,11 @@ struct Cli {
     /// Talk to a simulated ECU instead of the car (no cable needed).
     #[arg(long, global = true)]
     demo: bool,
+
+    /// With --demo: make the simulated ECU behave like a running engine on a
+    /// noisy line (busy replies, corrupted and missing bytes).
+    #[arg(long, global = true, requires = "demo")]
+    noisy: bool,
 }
 
 #[derive(Subcommand)]
@@ -97,8 +102,25 @@ fn main() -> Result<()> {
         }
         Command::Live { raw } => {
             let mut session = open(&cli)?;
+            let mut poller = LivePoller::new(Pacing::default());
             loop {
-                let data = ms41::read_live(&mut session)?;
+                let data = match poller.poll(&mut session) {
+                    Ok(data) => data,
+                    // A dead port won't come back on its own.
+                    Err(e @ ds2::SessionError::Io(_)) => return Err(e.into()),
+                    Err(e) => {
+                        let s = poller.stats();
+                        eprintln!(
+                            "  (retrying: {e}; link {:.0}%, pause {} ms)",
+                            s.quality() * 100.0,
+                            s.gap.as_millis()
+                        );
+                        if poller.looks_unsupported() {
+                            bail!("the ECU keeps refusing the live data request: {e}");
+                        }
+                        continue;
+                    }
+                };
                 let line: Vec<String> = ms41::LIVE_CHANNELS
                     .iter()
                     .map(|ch| match ch.decode(&data) {
@@ -130,7 +152,13 @@ fn main() -> Result<()> {
 fn open(cli: &Cli) -> Result<Session<Box<dyn Transport>>> {
     let transport: Box<dyn Transport> = if cli.demo {
         eprintln!("Using simulated ECU (demo mode)");
-        Box::new(SimulatedEcu::new())
+        let ecu = SimulatedEcu::new();
+        Box::new(if cli.noisy {
+            ecu.noisy(0x5eed)
+                .needs_gap(std::time::Duration::from_millis(60))
+        } else {
+            ecu
+        })
     } else {
         Box::new(open_cable(cli)?)
     };
@@ -144,6 +172,7 @@ fn open(cli: &Cli) -> Result<Session<Box<dyn Transport>>> {
             Trace::Tx(b) => eprintln!("  -> {}", hex(b)),
             Trace::Echo(b) => eprintln!("  (echo) {}", hex(b)),
             Trace::Rx(b) => eprintln!("  <- {}", hex(b)),
+            Trace::Discard(b) => eprintln!("  (discarded noise) {}", hex(b)),
         });
     }
     Ok(session)

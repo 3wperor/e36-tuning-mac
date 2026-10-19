@@ -31,7 +31,12 @@ The program is `target/release/e36`.
 ```sh
 cargo run --release -p e36-app            # connect to the car
 cargo run --release -p e36-app -- --demo  # try it with a simulated ECU, no cable needed
+cargo run --release -p e36-app -- --demo --noisy  # simulated ECU on a noisy line, like a running engine
 ```
+
+Next to the read rate, **link %** shows how many requests got a good reply.
+The tools pace themselves, retry errors and reconnect on their own; see
+[Logging with the engine running](docs/HARDWARE.md#logging-with-the-engine-running).
 
 - **Live**: engine speed, intake and coolant temperature and ignition timing,
   shown as gauges plus a 60-second chart. **These decoded values are not yet

@@ -11,13 +11,16 @@ use ds2::serial::available_ports;
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
-use recorder::Recorder;
+use recorder::{Recorder, Selection};
 use worker::{Command, Event, Source, Worker};
 
 /// How much history the chart keeps.
 const HISTORY: Duration = Duration::from_secs(60);
 /// How long a changed byte stays highlighted in the raw view.
 const HIGHLIGHT: Duration = Duration::from_millis(1500);
+
+const KEY_EXCLUDED: &str = "excluded_channels";
+const KEY_RECORD_RAW: &str = "record_raw";
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -29,8 +32,14 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "E36 MS41 Live",
         options,
-        Box::new(|_cc| {
+        Box::new(|cc| {
             let mut app = App::new();
+            if let Some(storage) = cc.storage {
+                let excluded: Vec<String> =
+                    eframe::get_value(storage, KEY_EXCLUDED).unwrap_or_default();
+                let raw = eframe::get_value(storage, KEY_RECORD_RAW).unwrap_or(true);
+                app.selection = Selection::from_excluded(&excluded, raw);
+            }
             // `e36-app --demo` opens straight into demo mode.
             if std::env::args().any(|a| a == "--demo") {
                 app.demo = true;
@@ -46,6 +55,7 @@ enum Tab {
     Live,
     Raw,
     Faults,
+    Recording,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -75,6 +85,7 @@ struct App {
     faults: Option<Vec<u8>>,
     confirm_clear: bool,
     recorder: Option<Recorder>,
+    selection: Selection,
     tab: Tab,
 }
 
@@ -98,6 +109,7 @@ impl App {
             faults: None,
             confirm_clear: false,
             recorder: None,
+            selection: Selection::default(),
             tab: Tab::Live,
         };
         app.refresh_ports();
@@ -268,10 +280,18 @@ impl App {
                         self.status = Some(format!("Saved {}", path.display()));
                     }
                 } else if ui
-                    .add_enabled(connected, egui::Button::new("Record CSV"))
+                    .add_enabled(
+                        connected && !self.selection.is_empty(),
+                        egui::Button::new("Record CSV"),
+                    )
+                    .on_disabled_hover_text(if connected {
+                        "Nothing selected in the Recording tab"
+                    } else {
+                        "Connect first"
+                    })
                     .clicked()
                 {
-                    match Recorder::start() {
+                    match Recorder::start(self.selection.clone()) {
                         Ok(r) => {
                             self.status = Some(format!("Recording to {}", r.path.display()));
                             self.recorder = Some(r);
@@ -376,6 +396,51 @@ impl App {
         });
     }
 
+    fn recording_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label("Choose what goes into your CSV recordings. Your choice is remembered.");
+        ui.add_space(6.0);
+        let recording = self.recorder.is_some();
+        if recording {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "Recording now. Stop recording to change this.",
+            );
+        }
+        ui.add_enabled_ui(!recording, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("All").clicked() {
+                    self.selection.set_all(true);
+                }
+                if ui.button("None").clicked() {
+                    self.selection.set_all(false);
+                }
+            });
+            ui.add_space(4.0);
+            for (ch, on) in LIVE_CHANNELS.iter().zip(&mut self.selection.channels) {
+                ui.checkbox(on, format!("{} ({})", ch.name, ch.unit));
+            }
+            ui.checkbox(&mut self.selection.raw, "Raw data block (all bytes)")
+                .on_hover_text(
+                    "Every byte the ECU sends. Keep this on for now: it's how we find \
+                     engine load, O2 and VANOS in your recordings.",
+                );
+        });
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(
+                "All of these come from the same ECU reply, so switching some off keeps the \
+                 file tidy but doesn't make logging faster.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.label(
+            egui::RichText::new(format!("Files are saved to {}", Recorder::dir().display()))
+                .small()
+                .weak(),
+        );
+    }
+
     fn faults_tab(&mut self, ui: &mut egui::Ui) {
         let connected = self.conn == Conn::Connected;
         ui.horizontal(|ui| {
@@ -436,6 +501,11 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, KEY_EXCLUDED, &self.selection.excluded());
+        eframe::set_value(storage, KEY_RECORD_RAW, &self.selection.raw);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if std::mem::take(&mut self.autoconnect) {
             self.connect(ui.ctx());
@@ -468,12 +538,14 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.tab, Tab::Live, "Live");
                 ui.selectable_value(&mut self.tab, Tab::Raw, "Raw bytes");
                 ui.selectable_value(&mut self.tab, Tab::Faults, "Faults");
+                ui.selectable_value(&mut self.tab, Tab::Recording, "Recording");
             });
             ui.separator();
             match self.tab {
                 Tab::Live => self.live_tab(ui),
                 Tab::Raw => self.raw_tab(ui),
                 Tab::Faults => self.faults_tab(ui),
+                Tab::Recording => self.recording_tab(ui),
             }
         });
 

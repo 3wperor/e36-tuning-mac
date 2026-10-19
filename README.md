@@ -40,6 +40,8 @@ cargo run --release -p e36-app -- --demo  # try it with a simulated ECU, no cabl
   change, so you can rev the engine and see which byte is RPM.
 - **Faults**: read the fault memory (raw bytes for now) and clear it, with a
   confirmation step.
+- **Recording**: tick the values you want in your logs. The app remembers
+  your choice.
 - **Record CSV** saves a log to `~/Documents/e36-logs/`. It opens in Numbers,
   Excel or MegaLogViewer.
 

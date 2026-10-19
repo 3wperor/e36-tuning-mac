@@ -38,3 +38,24 @@ cable's K-line.
 | `no response from ECU` | Ignition really in position II? Cable switch in the 7+8 position? Adapter fully seated in the 20-pin socket and the screw collar tightened? |
 | `echo mismatch` or garbage | Run again with `--echo off`, then with `--dtr low` or `--dtr high`. Some cables use DTR to select K-line mode. |
 | Still stuck | Run with `--trace` and save the output. Those bytes tell us exactly what's happening. |
+
+## Adding a wideband O2 sensor
+
+A wideband kit is a sensor, a controller and usually a gauge. Fitted like this,
+it **doesn't touch the ECU at all**: the ECU never sees it, and it won't cause
+fault codes.
+
+- **Fit it in its own bung.** Have a bung welded into the exhaust after the
+  manifold collector and before the catalytic converter. Leave the stock O2
+  sensors in place, because the ECU needs them for its own fuelling. Point the
+  sensor tip downward of horizontal (between about 10 and 2 o'clock with the
+  sensor on top), so condensation can't collect on it.
+- **Don't replace the stock O2 sensor with the wideband** unless the controller
+  has a "simulated narrowband output" wired to the ECU. Without it, the ECU
+  loses its O2 signal and logs a fault.
+- **Power:** switched 12 V, so it's only on with the ignition, plus a solid
+  ground. Never run the sensor in a running exhaust while it's unpowered,
+  because soot ruins it.
+- **To the Mac:** the controller's USB or serial output goes into a second USB
+  port. The app will read it and record it next to the ECU data. Tell me which
+  controller you have and I'll add support for it.

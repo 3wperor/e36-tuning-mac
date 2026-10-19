@@ -1,0 +1,11 @@
+[package]
+name = "e36-app"
+description = "Live data app for the BMW E36 Siemens MS41 DME"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+ds2 = { path = "../ds2", features = ["serial"] }
+eframe = "0.36"
+egui_plot = "0.37"

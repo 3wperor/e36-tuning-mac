@@ -13,22 +13,27 @@ exact variant is still unknown; `e36 ident` reads it from the car.
 | Transport | USB serial at 9600 baud, 8E1, handling of the K-line echo, timeouts | done (`crates/ds2/src/serial.rs`, `session.rs`) |
 | DS2 protocol | `[addr][len][payload][xor]` frames; the DME is at address `0x12` | done (`frame.rs`) |
 | Diagnostics | ECU identity, read and clear fault codes | done, raw output (`ms41.rs`) |
+| Simulator | Pretend MS41 for demo mode and tests | done (`sim.rs`) |
 | Fault decoding | Turn the raw fault bytes into codes and text | needs real captures from the car |
-| Logger | Read live values from RAM: gauges, CSV/MegaLogViewer export, wideband input | step 2 |
+| Logger | Live data block `0B 03`: gauges, chart, raw byte view, CSV export | first version done; value layout **unverified** |
+| Wideband | Read a wideband O2 controller over its own USB serial port | step 2 |
 | ECU definitions | Import the community TunerPro XDF files (tables, axes, scaling) | step 3 |
 | Map editor | 2D/3D tables, comparison against stock, undo, version history | step 3 |
 | Checksums | Recalculate MS41 checksums; refuse to flash if they don't match | step 3 |
 | Flasher | Identity check, full backup, erase, write, verify | step 4 |
 | Analysis | Fuel trim and wideband correction suggestions, knock per cylinder | step 5 |
-| GUI | Tauri desktop app on top of the same Rust core | starts with the logger |
+| GUI | Native window using egui (`crates/e36-app`) | first version done |
 
 ## Build order
 
 1. **Read-only CLI.** Connect, read the identity, read and clear faults.
    Proves the cable, the 20-pin adapter and the protocol on the Mac. *(done;
    needs testing on the car)*
-2. **Logger.** Live data in the terminal first, then the GUI with gauges and
-   CSV export.
+2. **Logger.** *(first version done: `e36 live` and the app)* Confirm
+   the live data layout on the car, then add wideband input and more channels.
+
+   egui was chosen over Tauri for the GUI because it's plain Rust: no Node or
+   web tooling, just `cargo run`.
 3. **Read the full binary and back it up.** Then XDF import, the map editor and
    checksums.
 4. **Flashing**, with the safety plan below.
@@ -74,6 +79,11 @@ recoverable rather than fatal.
 
 ## Open questions
 
+- **Is your ECU flashable?** The MS4X wiki notes that some MS41 units have a
+  flash chip that can't be reprogrammed; the most common ones can. The part
+  number from `e36 ident` should tell us which you have.
+- **The live data layout.** Record ~30 seconds in the app (idle, a few revs,
+  idle) and share the CSV. The raw bytes in it confirm or correct each value.
 - Exact DME part number and software version (`e36 ident` will show it).
 - How MS41 fault records are laid out. Capture `e36 faults --trace` from the
   car, ideally once with a known fault (e.g. an unplugged sensor) and once

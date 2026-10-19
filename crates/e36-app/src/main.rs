@@ -1,0 +1,485 @@
+//! Live data window for the E36 MS41 DME.
+
+mod recorder;
+mod worker;
+
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+use ds2::ms41::{self, LIVE_CHANNELS};
+use ds2::serial::available_ports;
+use eframe::egui;
+use egui_plot::{Line, Plot, PlotPoints};
+
+use recorder::Recorder;
+use worker::{Command, Event, Source, Worker};
+
+/// How much history the chart keeps.
+const HISTORY: Duration = Duration::from_secs(60);
+/// How long a changed byte stays highlighted in the raw view.
+const HIGHLIGHT: Duration = Duration::from_millis(1500);
+
+fn main() -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("E36 MS41 Live")
+            .with_inner_size([1000.0, 680.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "E36 MS41 Live",
+        options,
+        Box::new(|_cc| {
+            let mut app = App::new();
+            // `e36-app --demo` opens straight into demo mode.
+            if std::env::args().any(|a| a == "--demo") {
+                app.demo = true;
+                app.autoconnect = true;
+            }
+            Ok(Box::new(app))
+        }),
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Live,
+    Raw,
+    Faults,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Conn {
+    Disconnected,
+    Connecting,
+    Connected,
+}
+
+struct App {
+    ports: Vec<String>,
+    port: Option<String>,
+    demo: bool,
+    autoconnect: bool,
+    worker: Option<Worker>,
+    conn: Conn,
+    ident: Option<ms41::Ident>,
+    status: Option<String>,
+    live_note: Option<String>,
+
+    connected_at: Instant,
+    live: Option<Vec<u8>>,
+    changed_at: Vec<Instant>,
+    history: VecDeque<(Instant, Vec<Option<f64>>)>,
+    plot_channel: usize,
+
+    faults: Option<Vec<u8>>,
+    confirm_clear: bool,
+    recorder: Option<Recorder>,
+    tab: Tab,
+}
+
+impl App {
+    fn new() -> Self {
+        let mut app = Self {
+            ports: Vec::new(),
+            port: None,
+            demo: false,
+            autoconnect: false,
+            worker: None,
+            conn: Conn::Disconnected,
+            ident: None,
+            status: None,
+            live_note: None,
+            connected_at: Instant::now(),
+            live: None,
+            changed_at: Vec::new(),
+            history: VecDeque::new(),
+            plot_channel: 0,
+            faults: None,
+            confirm_clear: false,
+            recorder: None,
+            tab: Tab::Live,
+        };
+        app.refresh_ports();
+        app
+    }
+
+    fn refresh_ports(&mut self) {
+        // macOS lists each device twice; /dev/tty.* waits for carrier detect,
+        // so only the /dev/cu.* twin is usable.
+        self.ports = available_ports()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.port_name)
+            .filter(|n| !n.starts_with("/dev/tty."))
+            .collect();
+        if self.port.as_ref().is_none_or(|p| !self.ports.contains(p)) {
+            self.port = self
+                .ports
+                .iter()
+                .find(|n| n.contains("usbserial"))
+                .or(self.ports.first())
+                .cloned();
+        }
+    }
+
+    fn connect(&mut self, ctx: &egui::Context) {
+        let source = if self.demo {
+            Source::Demo
+        } else if let Some(p) = &self.port {
+            Source::Cable(p.clone())
+        } else {
+            self.status = Some("No cable selected. Plug it in and press ⟳.".into());
+            return;
+        };
+        let ctx = ctx.clone();
+        self.worker = Some(Worker::spawn(source, move || ctx.request_repaint()));
+        self.conn = Conn::Connecting;
+        self.status = None;
+        self.live_note = None;
+        self.live = None;
+        self.history.clear();
+        self.faults = None;
+    }
+
+    fn disconnect(&mut self) {
+        self.worker = None; // dropping it tells the thread to stop
+        self.conn = Conn::Disconnected;
+        self.recorder = None;
+    }
+
+    fn handle(&mut self, event: Event) {
+        match event {
+            Event::Connected(id) => {
+                self.conn = Conn::Connected;
+                self.connected_at = Instant::now();
+                self.ident = Some(id);
+            }
+            Event::Live(at, data) => self.on_live(at, data),
+            Event::LiveUnsupported(msg) => self.live_note = Some(msg),
+            Event::Faults(raw) => self.faults = Some(raw),
+            Event::FaultsCleared => {
+                self.status = Some("Fault memory cleared.".into());
+                if let Some(w) = &self.worker {
+                    w.send(Command::ReadFaults);
+                }
+            }
+            Event::Error(msg) => self.status = Some(msg),
+            Event::Disconnected(reason) => {
+                self.disconnect();
+                if reason.is_some() {
+                    self.status = reason;
+                }
+            }
+        }
+    }
+
+    fn on_live(&mut self, at: Instant, data: Vec<u8>) {
+        if self.changed_at.len() != data.len() {
+            self.changed_at = vec![at - HIGHLIGHT; data.len()];
+        }
+        if let Some(prev) = &self.live {
+            for (i, (a, b)) in prev.iter().zip(&data).enumerate() {
+                if a != b {
+                    self.changed_at[i] = at;
+                }
+            }
+        }
+        if let Some(rec) = &mut self.recorder {
+            if let Err(e) = rec.write(at, &data) {
+                self.status = Some(format!("recording stopped: {e}"));
+                self.recorder = None;
+            }
+        }
+        let values = LIVE_CHANNELS.iter().map(|ch| ch.decode(&data)).collect();
+        self.history.push_back((at, values));
+        while self
+            .history
+            .front()
+            .is_some_and(|(t, _)| at.duration_since(*t) > HISTORY)
+        {
+            self.history.pop_front();
+        }
+        self.live = Some(data);
+    }
+
+    /// Live reads per second over the last few seconds.
+    fn rate(&self) -> f64 {
+        let Some((last, _)) = self.history.back() else {
+            return 0.0;
+        };
+        let window = Duration::from_secs(3);
+        let n = self
+            .history
+            .iter()
+            .rev()
+            .take_while(|(t, _)| last.duration_since(*t) <= window)
+            .count();
+        n as f64 / window.as_secs_f64()
+    }
+
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let idle = self.conn == Conn::Disconnected;
+            ui.add_enabled_ui(idle && !self.demo, |ui| {
+                egui::ComboBox::from_id_salt("port")
+                    .width(260.0)
+                    .selected_text(self.port.as_deref().unwrap_or("no cable found"))
+                    .show_ui(ui, |ui| {
+                        for p in &self.ports {
+                            ui.selectable_value(&mut self.port, Some(p.clone()), p);
+                        }
+                    });
+                if ui.button("⟳").on_hover_text("Refresh ports").clicked() {
+                    self.refresh_ports();
+                }
+            });
+            ui.add_enabled(idle, egui::Checkbox::new(&mut self.demo, "Demo (no car)"));
+
+            match self.conn {
+                Conn::Disconnected => {
+                    if ui.button("Connect").clicked() {
+                        self.connect(ui.ctx());
+                    }
+                }
+                Conn::Connecting => {
+                    ui.spinner();
+                    ui.label("Connecting…");
+                }
+                Conn::Connected => {
+                    if ui.button("Disconnect").clicked() {
+                        self.disconnect();
+                    }
+                    let pn = self
+                        .ident
+                        .as_ref()
+                        .and_then(|i| i.part_number_pretty())
+                        .unwrap_or_else(|| "unknown".into());
+                    ui.label(format!("DME {pn}  ·  {:.1} reads/s", self.rate()));
+                }
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let connected = self.conn == Conn::Connected;
+                let recording = self.recorder.as_ref().map(|r| r.path.clone());
+                if let Some(path) = recording {
+                    if ui.button("Stop recording").clicked() {
+                        self.recorder = None;
+                        self.status = Some(format!("Saved {}", path.display()));
+                    }
+                } else if ui
+                    .add_enabled(connected, egui::Button::new("Record CSV"))
+                    .clicked()
+                {
+                    match Recorder::start() {
+                        Ok(r) => {
+                            self.status = Some(format!("Recording to {}", r.path.display()));
+                            self.recorder = Some(r);
+                        }
+                        Err(e) => self.status = Some(format!("can't record: {e}")),
+                    }
+                }
+            });
+        });
+    }
+
+    fn live_tab(&mut self, ui: &mut egui::Ui) {
+        if let Some(note) = &self.live_note {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                format!("Live data unavailable: {note}."),
+            );
+        }
+        ui.label(
+            egui::RichText::new(
+                "Decoded values are UNVERIFIED for your ECU. Check them against the raw bytes before trusting them.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add_space(6.0);
+
+        let data = self.live.as_deref().unwrap_or(&[]);
+        ui.columns(LIVE_CHANNELS.len(), |cols| {
+            for (ch, ui) in LIVE_CHANNELS.iter().zip(cols) {
+                ui.group(|ui| {
+                    ui.label(ch.name);
+                    let value = ch.decode(data);
+                    ui.label(
+                        egui::RichText::new(match value {
+                            Some(v) => format!("{v:.0} {}", ch.unit),
+                            None => "—".into(),
+                        })
+                        .size(30.0)
+                        .strong(),
+                    );
+                    let frac = value.map_or(0.0, |v| ((v - ch.min) / (ch.max - ch.min)) as f32);
+                    ui.add(egui::ProgressBar::new(frac.clamp(0.0, 1.0)));
+                });
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label("Chart:");
+            for (i, ch) in LIVE_CHANNELS.iter().enumerate() {
+                ui.selectable_value(&mut self.plot_channel, i, ch.name);
+            }
+        });
+        let start = self.connected_at;
+        let idx = self.plot_channel;
+        let points: PlotPoints = self
+            .history
+            .iter()
+            .filter_map(|(t, vals)| Some([t.duration_since(start).as_secs_f64(), vals[idx]?]))
+            .collect();
+        let ch = &LIVE_CHANNELS[idx];
+        Plot::new("history")
+            .x_axis_label("seconds")
+            .y_axis_label(format!("{} ({})", ch.name, ch.unit))
+            .allow_drag(false)
+            .allow_scroll(false)
+            .show(ui, |plot| plot.line(Line::new(ch.name, points)));
+    }
+
+    fn raw_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            "Every byte of the live data block. Bytes that just changed light up. Rev the engine \
+             or let it warm up and watch which bytes move: that's how we confirm what each one means.",
+        );
+        ui.add_space(6.0);
+        let Some(data) = &self.live else {
+            ui.weak("No live data yet.");
+            return;
+        };
+        let now = Instant::now();
+        egui::Grid::new("raw").striped(true).show(ui, |ui| {
+            for (i, b) in data.iter().enumerate() {
+                let age = now.duration_since(self.changed_at[i]);
+                let heat = 1.0 - (age.as_secs_f32() / HIGHLIGHT.as_secs_f32()).min(1.0);
+                let text = egui::RichText::new(format!("{i:>2}: {b:02X} ({b:>3})")).monospace();
+                let text = if heat > 0.0 {
+                    text.background_color(egui::Color32::from_rgba_unmultiplied(
+                        255,
+                        140,
+                        0,
+                        (heat * 160.0) as u8,
+                    ))
+                } else {
+                    text
+                };
+                ui.label(text);
+                if i % 8 == 7 {
+                    ui.end_row();
+                }
+            }
+        });
+    }
+
+    fn faults_tab(&mut self, ui: &mut egui::Ui) {
+        let connected = self.conn == Conn::Connected;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(connected, egui::Button::new("Read faults"))
+                .clicked()
+            {
+                if let Some(w) = &self.worker {
+                    w.send(Command::ReadFaults);
+                }
+            }
+            if ui
+                .add_enabled(
+                    connected && self.faults.is_some(),
+                    egui::Button::new("Clear faults…"),
+                )
+                .on_disabled_hover_text("Read the faults first so they're on screen")
+                .clicked()
+            {
+                self.confirm_clear = true;
+            }
+        });
+        ui.add_space(6.0);
+        match &self.faults {
+            None => {
+                ui.weak("Not read yet.");
+            }
+            Some(raw) => {
+                ui.label(format!("Fault memory ({} bytes):", raw.len()));
+                for chunk in raw.chunks(16) {
+                    ui.monospace(ds2::hex(chunk));
+                }
+                ui.weak("Turning these bytes into fault codes is not implemented yet.");
+            }
+        }
+
+        if self.confirm_clear {
+            egui::Window::new("Clear fault codes?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label("This erases the stored fault codes in the DME.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Erase").clicked() {
+                            if let Some(w) = &self.worker {
+                                w.send(Command::ClearFaults);
+                            }
+                            self.confirm_clear = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_clear = false;
+                        }
+                    });
+                });
+        }
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if std::mem::take(&mut self.autoconnect) {
+            self.connect(ui.ctx());
+        }
+        let events: Vec<Event> = self
+            .worker
+            .as_ref()
+            .map(|w| w.events.try_iter().collect())
+            .unwrap_or_default();
+        for e in events {
+            self.handle(e);
+        }
+
+        egui::Panel::top("top").show(ui, |ui| {
+            ui.add_space(4.0);
+            self.top_bar(ui);
+            ui.add_space(4.0);
+        });
+        egui::Panel::bottom("status").show(ui, |ui| {
+            ui.label(self.status.as_deref().unwrap_or(match self.conn {
+                Conn::Disconnected => {
+                    "Not connected. Ignition to position II, then Connect (or tick Demo)."
+                }
+                Conn::Connecting => "Asking the DME who it is…",
+                Conn::Connected => "Connected.",
+            }));
+        });
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Live, "Live");
+                ui.selectable_value(&mut self.tab, Tab::Raw, "Raw bytes");
+                ui.selectable_value(&mut self.tab, Tab::Faults, "Faults");
+            });
+            ui.separator();
+            match self.tab {
+                Tab::Live => self.live_tab(ui),
+                Tab::Raw => self.raw_tab(ui),
+                Tab::Faults => self.faults_tab(ui),
+            }
+        });
+
+        if self.conn == Conn::Connected {
+            // Keep the byte highlights fading even between reads.
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        }
+    }
+}

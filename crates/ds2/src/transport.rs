@@ -75,3 +75,17 @@ impl Transport for MockTransport {
         Ok(())
     }
 }
+
+impl<T: Transport + ?Sized> Transport for Box<T> {
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        (**self).write_all(bytes)
+    }
+
+    fn read_byte(&mut self, timeout: Duration) -> io::Result<Option<u8>> {
+        (**self).read_byte(timeout)
+    }
+
+    fn clear_input(&mut self) -> io::Result<()> {
+        (**self).clear_input()
+    }
+}

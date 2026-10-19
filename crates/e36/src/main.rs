@@ -3,7 +3,7 @@ use std::io::{self, BufRead, Write};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use ds2::serial::{available_ports, LineOptions, SerialPortType, SerialTransport};
-use ds2::{hex, ms41, EchoMode, Session, Trace};
+use ds2::{hex, ms41, EchoMode, Session, SimulatedEcu, Trace, Transport};
 
 /// Diagnostics for the BMW E36 Siemens MS41 DME over a K+DCAN cable.
 ///
@@ -33,6 +33,10 @@ struct Cli {
     /// Force the RTS line level.
     #[arg(long, global = true, value_enum)]
     rts: Option<Level>,
+
+    /// Talk to a simulated ECU instead of the car (no cable needed).
+    #[arg(long, global = true)]
+    demo: bool,
 }
 
 #[derive(Subcommand)]
@@ -43,6 +47,12 @@ enum Command {
     Ident,
     /// Read the stored fault codes.
     Faults,
+    /// Stream live data until Ctrl-C. Decoded values are unverified.
+    Live {
+        /// Also print the raw data block.
+        #[arg(long)]
+        raw: bool,
+    },
     /// Read, then erase, the stored fault codes.
     ClearFaults {
         /// Don't ask for confirmation.
@@ -85,6 +95,23 @@ fn main() -> Result<()> {
             print_faults(&faults);
             Ok(())
         }
+        Command::Live { raw } => {
+            let mut session = open(&cli)?;
+            loop {
+                let data = ms41::read_live(&mut session)?;
+                let line: Vec<String> = ms41::LIVE_CHANNELS
+                    .iter()
+                    .map(|ch| match ch.decode(&data) {
+                        Some(v) => format!("{} {v:.1} {}", ch.name, ch.unit),
+                        None => format!("{} -", ch.name),
+                    })
+                    .collect();
+                println!("{}", line.join(" | "));
+                if raw {
+                    println!("  {}", hex(&data));
+                }
+            }
+        }
         Command::ClearFaults { yes } => {
             let mut session = open(&cli)?;
             let faults = ms41::read_faults(&mut session)?;
@@ -100,18 +127,13 @@ fn main() -> Result<()> {
     }
 }
 
-fn open(cli: &Cli) -> Result<Session<SerialTransport>> {
-    let path = match &cli.port {
-        Some(p) => p.clone(),
-        None => pick_port(&candidates()?)?,
+fn open(cli: &Cli) -> Result<Session<Box<dyn Transport>>> {
+    let transport: Box<dyn Transport> = if cli.demo {
+        eprintln!("Using simulated ECU (demo mode)");
+        Box::new(SimulatedEcu::new())
+    } else {
+        Box::new(open_cable(cli)?)
     };
-    eprintln!("Using {path}");
-    let lines = LineOptions {
-        dtr: cli.dtr.map(|l| matches!(l, Level::High)),
-        rts: cli.rts.map(|l| matches!(l, Level::High)),
-    };
-    let transport =
-        SerialTransport::open(&path, lines).with_context(|| format!("could not open {path}"))?;
     let mut session = Session::new(transport).with_echo(match cli.echo {
         Echo::Auto => EchoMode::Auto,
         Echo::On => EchoMode::Expect,
@@ -125,6 +147,19 @@ fn open(cli: &Cli) -> Result<Session<SerialTransport>> {
         });
     }
     Ok(session)
+}
+
+fn open_cable(cli: &Cli) -> Result<SerialTransport> {
+    let path = match &cli.port {
+        Some(p) => p.clone(),
+        None => pick_port(&candidates()?)?,
+    };
+    eprintln!("Using {path}");
+    let lines = LineOptions {
+        dtr: cli.dtr.map(|l| matches!(l, Level::High)),
+        rts: cli.rts.map(|l| matches!(l, Level::High)),
+    };
+    SerialTransport::open(&path, lines).with_context(|| format!("could not open {path}"))
 }
 
 fn print_faults(faults: &ms41::FaultMemory) {

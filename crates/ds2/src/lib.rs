@@ -16,6 +16,7 @@
 //! - [`transport`]: the byte-pipe abstraction plus a scripted mock for tests
 //! - [`session`]: request/response handling, K-line echo, timeouts
 //! - [`ms41`]: commands for the Siemens MS41 DME (M52/S52 engines)
+//! - [`sim`]: a simulated MS41 for demo mode and tests
 //! - `serial` (feature `serial`): the real USB cable
 
 pub mod frame;
@@ -23,10 +24,12 @@ pub mod ms41;
 #[cfg(feature = "serial")]
 pub mod serial;
 pub mod session;
+pub mod sim;
 pub mod transport;
 
 pub use frame::{checksum, Frame, FrameError, Status};
 pub use session::{EchoMode, Response, Session, SessionError, Timeouts, Trace};
+pub use sim::SimulatedEcu;
 pub use transport::{MockTransport, Transport};
 
 /// Formats bytes as space-separated upper-case hex, e.g. `12 04 00 16`.

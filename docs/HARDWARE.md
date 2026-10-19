@@ -47,9 +47,9 @@ fault codes.
 
 - **Fit it in its own bung.** Have a bung welded into the exhaust after the
   manifold collector and before the catalytic converter. Leave the stock O2
-  sensors in place, because the ECU needs them for its own fuelling. Point the
-  sensor tip downward of horizontal (between about 10 and 2 o'clock with the
-  sensor on top), so condensation can't collect on it.
+  sensors in place, because the ECU needs them for its own fuelling. Mount it on
+  the top half of the pipe, between the 10 and 2 o'clock positions, so the tip
+  points down and condensation drains away from it.
 - **Don't replace the stock O2 sensor with the wideband** unless the controller
   has a "simulated narrowband output" wired to the ECU. Without it, the ECU
   loses its O2 signal and logs a fault.

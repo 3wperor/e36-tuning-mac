@@ -3,6 +3,8 @@
 //! Only read-only diagnostics plus fault clearing live here so far. Nothing in
 //! this module touches the ECU's flash.
 
+pub mod fault_codes;
+
 use crate::session::{Session, SessionError};
 use crate::transport::Transport;
 
@@ -58,11 +60,67 @@ impl Ident {
     }
 }
 
-/// Raw fault memory. Decoding the individual codes is MS41-specific and will be
-/// added once we have captured real replies from a car to test against.
+/// Requests tried in order to read the fault memory. A forum bench capture of
+/// an MS41 uses `04 01`; plain `04` is the generic DS2 form.
+pub const READ_FAULTS_REQUESTS: [&[u8]; 2] = [&[cmd::READ_FAULTS, 0x01], &[cmd::READ_FAULTS]];
+
+/// Size of one stored fault in the reply, from the same forum capture.
+/// UNVERIFIED for your ECU.
+pub const FAULT_RECORD_LEN: usize = 8;
+
+/// The fault memory exactly as the DME sent it (after the status byte).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FaultMemory {
     pub raw: Vec<u8>,
+}
+
+/// One stored fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fault {
+    /// BMW decimal fault code.
+    pub code: u8,
+    /// The whole record, code included. The other bytes (fault type, how
+    /// often it happened, conditions at the time) aren't decoded yet.
+    pub record: Vec<u8>,
+}
+
+impl Fault {
+    pub fn description(&self) -> Option<&'static str> {
+        fault_codes::describe(self.code)
+    }
+}
+
+impl FaultMemory {
+    /// Best-effort decode, assuming the layout seen in a forum capture: a count
+    /// byte, then one fixed-size record per fault starting with its code.
+    ///
+    /// Returns `None` when the reply doesn't fit that layout, so callers can
+    /// fall back to the raw bytes instead of showing made-up codes.
+    pub fn decode(&self) -> Option<Vec<Fault>> {
+        let (&count, records) = self.raw.split_first()?;
+        let count = count as usize;
+        if count == 0 {
+            return Some(Vec::new());
+        }
+        let size =
+            if records.len() % FAULT_RECORD_LEN == 0 && count * FAULT_RECORD_LEN <= records.len() {
+                FAULT_RECORD_LEN
+            } else if !records.is_empty() && records.len() % count == 0 {
+                records.len() / count
+            } else {
+                return None;
+            };
+        Some(
+            records
+                .chunks(size)
+                .take(count)
+                .map(|r| Fault {
+                    code: r[0],
+                    record: r.to_vec(),
+                })
+                .collect(),
+        )
+    }
 }
 
 /// Request for the "general values" live data block (group 0x0B, subgroup 0x03).
@@ -177,10 +235,20 @@ pub fn ident<T: Transport>(session: &mut Session<T>) -> Result<Ident, SessionErr
         .map(|d| Ident::parse(&d))
 }
 
+/// Reads the fault memory, trying each of [`READ_FAULTS_REQUESTS`] until the
+/// DME accepts one.
 pub fn read_faults<T: Transport>(session: &mut Session<T>) -> Result<FaultMemory, SessionError> {
-    session
-        .request_ok(DME_ADDRESS, &[cmd::READ_FAULTS])
-        .map(|raw| FaultMemory { raw })
+    let mut rejected = None;
+    for request in READ_FAULTS_REQUESTS {
+        match session.request_ok(DME_ADDRESS, request) {
+            Ok(raw) => return Ok(FaultMemory { raw }),
+            Err(SessionError::Negative(status)) => rejected = Some(status),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(SessionError::Negative(
+        rejected.expect("at least one request"),
+    ))
 }
 
 pub fn clear_faults<T: Transport>(session: &mut Session<T>) -> Result<(), SessionError> {
@@ -255,11 +323,94 @@ mod tests {
     #[test]
     fn read_and_clear_faults_over_mock_ecu() {
         let mock = MockTransport::new(true)
-            .expect([0x12, 0x04, 0x04, 0x12], reply(&[0xA0, 0x01, 0x23]))
+            .expect([0x12, 0x05, 0x04, 0x01, 0x12], reply(&[0xA0, 0x01, 0x23]))
             .expect([0x12, 0x04, 0x05, 0x13], reply(&[0xA0]));
         let mut s = Session::new(mock);
         assert_eq!(read_faults(&mut s).unwrap().raw, vec![0x01, 0x23]);
         clear_faults(&mut s).unwrap();
         assert!(s.transport().is_finished());
+    }
+
+    #[test]
+    fn read_faults_falls_back_to_plain_request() {
+        let mock = MockTransport::new(true)
+            .expect([0x12, 0x05, 0x04, 0x01, 0x12], reply(&[0xB0]))
+            .expect([0x12, 0x04, 0x04, 0x12], reply(&[0xA0, 0x00]));
+        let mut s = Session::new(mock);
+        assert_eq!(read_faults(&mut s).unwrap().raw, vec![0x00]);
+        assert!(s.transport().is_finished());
+    }
+
+    #[test]
+    fn read_faults_reports_rejection_when_both_fail() {
+        let mock = MockTransport::new(true)
+            .expect([0x12, 0x05, 0x04, 0x01, 0x12], reply(&[0xB0]))
+            .expect([0x12, 0x04, 0x04, 0x12], reply(&[0xA2]));
+        let err = read_faults(&mut Session::new(mock)).unwrap_err();
+        assert!(matches!(
+            err,
+            SessionError::Negative(crate::Status::Rejected)
+        ));
+    }
+
+    fn record(code: u8) -> Vec<u8> {
+        let mut r = vec![0u8; FAULT_RECORD_LEN];
+        r[0] = code;
+        r[1] = 0x11;
+        r
+    }
+
+    #[test]
+    fn decodes_count_and_records() {
+        let raw = [vec![2], record(10), record(243)].concat();
+        let faults = FaultMemory { raw }.decode().unwrap();
+        assert_eq!(faults.len(), 2);
+        assert_eq!(faults[0].code, 10);
+        assert_eq!(faults[0].record, record(10));
+        assert_eq!(faults[1].description(), Some("Misfire, cylinder 6"));
+    }
+
+    #[test]
+    fn decodes_fixed_slots_with_fewer_faults() {
+        // Ten slots sent, only the first one in use.
+        let mut raw = vec![1];
+        raw.extend(record(57));
+        raw.extend(vec![0u8; FAULT_RECORD_LEN * 9]);
+        let faults = FaultMemory { raw }.decode().unwrap();
+        assert_eq!(faults.len(), 1);
+        assert_eq!(faults[0].code, 57);
+    }
+
+    #[test]
+    fn decodes_other_record_sizes_when_consistent() {
+        let raw = vec![2, 10, 0xAA, 0xBB, 14, 0xCC, 0xDD];
+        let faults = FaultMemory { raw }.decode().unwrap();
+        assert_eq!(faults.iter().map(|f| f.code).collect::<Vec<_>>(), [10, 14]);
+        assert_eq!(faults[1].record, vec![14, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn empty_memory_decodes_to_no_faults() {
+        assert_eq!(FaultMemory { raw: vec![0] }.decode(), Some(vec![]));
+        assert_eq!(
+            FaultMemory {
+                raw: vec![0; 1 + FAULT_RECORD_LEN * 10]
+            }
+            .decode(),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn unrecognised_layout_is_none() {
+        assert_eq!(FaultMemory { raw: vec![] }.decode(), None);
+        assert_eq!(
+            FaultMemory {
+                raw: vec![3, 1, 2, 3, 4]
+            }
+            .decode(),
+            None
+        );
+        assert_eq!(FaultMemory { raw: vec![5] }.decode(), None);
     }
 }

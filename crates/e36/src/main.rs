@@ -163,11 +163,26 @@ fn open_cable(cli: &Cli) -> Result<SerialTransport> {
 }
 
 fn print_faults(faults: &ms41::FaultMemory) {
-    println!("Fault memory ({} bytes):", faults.raw.len());
+    match faults.decode() {
+        Some(list) if list.is_empty() => println!("No faults stored."),
+        Some(list) => {
+            println!("{} fault(s) stored:", list.len());
+            for f in &list {
+                println!(
+                    "  {:>3}  {:<50} [{}]",
+                    f.code,
+                    f.description().unwrap_or("Unknown code"),
+                    hex(&f.record)
+                );
+            }
+        }
+        None => println!("Fault reply layout not recognised; showing raw bytes only."),
+    }
+    println!("Raw fault memory ({} bytes):", faults.raw.len());
     for chunk in faults.raw.chunks(16) {
         println!("  {}", hex(chunk));
     }
-    println!("(Decoding MS41 fault codes into text is not implemented yet; the raw bytes above are what the DME sent.)");
+    println!("(Descriptions come from community lists and the reply layout is unverified. Check against the raw bytes.)");
 }
 
 fn confirm(question: &str) -> Result<bool> {

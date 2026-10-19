@@ -30,7 +30,12 @@ impl SimulatedEcu {
         Self {
             start: Instant::now(),
             rx: VecDeque::new(),
-            faults: vec![0x02, 0x1A, 0x00, 0x05, 0x2B, 0x00],
+            // Coolant temperature sensor and knock sensor bank 1, laid out as
+            // count + 8-byte records.
+            faults: vec![
+                0x02, 10, 0x21, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 57, 0x11, 0x01, 0x00, 0x00,
+                0x00, 0x00, 0x00,
+            ],
         }
     }
 
@@ -49,7 +54,7 @@ impl SimulatedEcu {
     fn reply_to(&mut self, payload: &[u8]) -> Vec<u8> {
         match payload {
             [cmd::IDENT] => [&[0xA0][..], b"1429861", &[0x00, 0x00]].concat(),
-            [cmd::READ_FAULTS] => [&[0xA0][..], &self.faults].concat(),
+            [cmd::READ_FAULTS] | [cmd::READ_FAULTS, 0x01] => [&[0xA0][..], &self.faults].concat(),
             [cmd::CLEAR_FAULTS] => {
                 self.faults = vec![0x00];
                 vec![0xA0]

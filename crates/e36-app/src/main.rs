@@ -469,11 +469,49 @@ impl App {
                 ui.weak("Not read yet.");
             }
             Some(raw) => {
-                ui.label(format!("Fault memory ({} bytes):", raw.len()));
+                let memory = ms41::FaultMemory { raw: raw.clone() };
+                match memory.decode() {
+                    Some(list) if list.is_empty() => {
+                        ui.label(egui::RichText::new("No faults stored.").strong());
+                    }
+                    Some(list) => {
+                        ui.label(
+                            egui::RichText::new(format!("{} fault(s) stored", list.len())).strong(),
+                        );
+                        ui.add_space(4.0);
+                        egui::Grid::new("faults").striped(true).show(ui, |ui| {
+                            ui.strong("Code");
+                            ui.strong("Description");
+                            ui.strong("Record bytes");
+                            ui.end_row();
+                            for f in &list {
+                                ui.monospace(f.code.to_string());
+                                match f.description() {
+                                    Some(d) => ui.label(d),
+                                    None => ui.weak("Unknown code"),
+                                };
+                                ui.monospace(ds2::hex(&f.record));
+                                ui.end_row();
+                            }
+                        });
+                    }
+                    None => {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            "Fault reply layout not recognised; showing raw bytes only.",
+                        );
+                    }
+                }
+                ui.add_space(8.0);
+                ui.weak(format!("Raw fault memory ({} bytes):", raw.len()));
                 for chunk in raw.chunks(16) {
                     ui.monospace(ds2::hex(chunk));
                 }
-                ui.weak("Turning these bytes into fault codes is not implemented yet.");
+                ui.add_space(4.0);
+                ui.weak(
+                    "Descriptions come from community lists and the reply layout is unverified \
+                     for your ECU. Check them against the raw bytes.",
+                );
             }
         }
 

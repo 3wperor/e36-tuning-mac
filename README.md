@@ -38,8 +38,9 @@ cargo run --release -p e36-app -- --demo  # try it with a simulated ECU, no cabl
   verified for your ECU**; see below.
 - **Raw bytes**: every byte of the live data block. Bytes light up when they
   change, so you can rev the engine and see which byte is RPM.
-- **Faults**: read the fault memory (raw bytes for now) and clear it, with a
-  confirmation step.
+- **Faults**: read the stored fault codes with plain-English descriptions,
+  and clear them with a confirmation step. The raw bytes are always shown
+  too, because the reply layout is still unverified for your ECU.
 - **Recording**: tick the values you want in your logs. The app remembers
   your choice.
 - **Record CSV** saves a log to `~/Documents/e36-logs/`. It opens in Numbers,
@@ -58,7 +59,7 @@ turn the ignition to position II with the engine off.
 ```sh
 ./target/release/e36 ports                   # find the cable
 ./target/release/e36 ident --trace           # DME part number + raw bytes
-./target/release/e36 faults --trace          # stored fault codes (raw)
+./target/release/e36 faults --trace          # stored fault codes, translated
 ./target/release/e36 live --raw              # live data in the terminal
 ./target/release/e36 clear-faults            # shows faults, asks, then erases
 ```

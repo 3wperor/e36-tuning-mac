@@ -50,6 +50,12 @@ The tools pace themselves, retry errors and reconnect on their own; see
   log of every switch with the RPM it happened at. The first time, use the
   bit finder in the same tab: drive or rev so VANOS switches, spot the bit
   that flips each time, and click it. The app remembers it.
+- **Knock & misfire**: the ECU's global knock retard over time against
+  engine speed (raw values for now, units still to be calibrated), a
+  per-cylinder misfire and knock-sensor status, and a log of fault codes
+  that appear or clear while you drive. The fault memory is re-checked
+  every 15 s. A Euro MS41.0 may not detect misfires at all; see the note in
+  the tab.
 - **Recording**: tick the values you want in your logs. The app remembers
   your choice.
 - **Record CSV** saves a log to `~/Documents/e36-logs/`. It opens in Numbers,

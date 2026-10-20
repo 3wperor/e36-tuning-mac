@@ -18,6 +18,7 @@ exact variant is still unknown; `e36 ident` reads it from the car.
 | Fault decoding | Fault codes to text (`ms41/fault_codes.rs`); reply layout from a forum capture | first version done; layout **unverified** |
 | Logger | Live data block `0B 03`: gauges, chart, raw byte view, CSV export | first version done; value layout **unverified** |
 | VANOS view | On/off indicator, timeline, switch log with RPM, bit finder to locate the flag | done; flag location found per car with the finder |
+| Knock & misfire | Global knock retard (`0B 93`, raw, units unverified) polled ~1/s; fault watch every 15 s with per-cylinder misfire (codes 238-243) and knock-sensor (57/59) status; events recorded | done; knock request and units to confirm on the car; per-cylinder knock retard still unknown |
 | Wideband | Read a wideband O2 controller over its own USB serial port | step 2 |
 | ECU definitions | Import the community TunerPro XDF files (tables, axes, scaling) | step 3 |
 | Map editor | 2D/3D tables, comparison against stock, undo, version history | step 3 |
@@ -91,3 +92,10 @@ recoverable rather than fatal.
   8-byte records starting with the code. Capture `e36 faults --trace` from the
   car, ideally once with a known fault (e.g. an unplugged sensor) and once
   after clearing, to confirm it and to decode the other bytes in each record.
+- **Knock retard.** Does your ECU answer `0B 93`, and what do its bytes mean?
+  A recording that includes a knock event would let us calibrate the units.
+  Per-cylinder knock retard lives in ECU memory at addresses that differ by
+  software version; reading it needs your software number from `e36 ident`.
+- **Misfire detection on MS41.0.** Community reports say the Euro MS41.0 has
+  no misfire detection logic (it arrived with the US MS41.1); others dispute
+  it. If no misfire code ever appears, that's probably why.

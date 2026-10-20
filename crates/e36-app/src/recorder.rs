@@ -15,6 +15,19 @@ pub struct Selection {
     pub raw: bool,
     /// VANOS on/off, once its bit has been picked.
     pub vanos: bool,
+    /// The knock retard reply (raw).
+    pub knock: bool,
+    /// Fault codes appearing or clearing while recording.
+    pub events: bool,
+}
+
+/// Values for a row that come from requests other than the live block.
+#[derive(Default)]
+pub struct Extras<'a> {
+    /// The latest knock retard reply.
+    pub knock: Option<&'a [u8]>,
+    /// Fault events since the previous row.
+    pub events: &'a [String],
 }
 
 impl Default for Selection {
@@ -23,6 +36,8 @@ impl Default for Selection {
             channels: vec![true; LIVE_CHANNELS.len()],
             raw: true,
             vanos: true,
+            knock: true,
+            events: true,
         }
     }
 }
@@ -37,7 +52,7 @@ impl Selection {
                 .map(|ch| !excluded.iter().any(|n| n == ch.name))
                 .collect(),
             raw,
-            vanos: true,
+            ..Self::default()
         }
     }
 
@@ -52,13 +67,19 @@ impl Selection {
 
     /// True when a recording would have no columns besides time.
     pub fn is_empty(&self, vanos_available: bool) -> bool {
-        !self.raw && !(self.vanos && vanos_available) && !self.channels.contains(&true)
+        !self.raw
+            && !self.knock
+            && !self.events
+            && !(self.vanos && vanos_available)
+            && !self.channels.contains(&true)
     }
 
     pub fn set_all(&mut self, on: bool) {
         self.channels.fill(on);
         self.raw = on;
         self.vanos = on;
+        self.knock = on;
+        self.events = on;
     }
 
     fn header(&self, vanos: Option<Flag>) -> String {
@@ -69,13 +90,19 @@ impl Selection {
         if vanos.is_some() {
             line += ",VANOS (on/off)";
         }
+        if self.knock {
+            line += ",Knock (raw),Knock reply (hex)";
+        }
+        if self.events {
+            line += ",Fault events";
+        }
         if self.raw {
             line += ",raw_hex";
         }
         line
     }
 
-    fn row(&self, seconds: f64, data: &[u8], vanos: Option<Flag>) -> String {
+    fn row(&self, seconds: f64, data: &[u8], vanos: Option<Flag>, extras: &Extras) -> String {
         let mut line = format!("{seconds:.3}");
         for (ch, _) in self.selected() {
             line += &match ch.decode(data) {
@@ -89,6 +116,22 @@ impl Selection {
                 Some(false) => ",0",
                 None => ",",
             };
+        }
+        if self.knock {
+            line += &match extras.knock {
+                Some(k) => format!(
+                    ",{},{}",
+                    k.first().map_or(String::new(), |b| b.to_string()),
+                    ds2::hex(k)
+                ),
+                None => ",,".into(),
+            };
+        }
+        if self.events {
+            line += ",";
+            if !extras.events.is_empty() {
+                line += &csv_quote(&extras.events.join("; "));
+            }
         }
         if self.raw {
             line += &format!(",{}", ds2::hex(data));
@@ -143,14 +186,19 @@ impl Recorder {
         })
     }
 
-    pub fn write(&mut self, at: Instant, data: &[u8]) -> io::Result<()> {
+    pub fn write(&mut self, at: Instant, data: &[u8], extras: &Extras) -> io::Result<()> {
         let seconds = at.saturating_duration_since(self.start).as_secs_f64();
         writeln!(
             self.file,
             "{}",
-            self.selection.row(seconds, data, self.vanos)
+            self.selection.row(seconds, data, self.vanos, extras)
         )
     }
+}
+
+/// Quotes a CSV field (fault descriptions contain commas).
+fn csv_quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
 }
 
 #[cfg(test)]
@@ -166,8 +214,10 @@ mod tests {
     #[test]
     fn everything_selected_by_default() {
         let sel = Selection::default();
-        assert_eq!(sel.header(None).split(',').count(), LIVE_CHANNELS.len() + 2);
-        assert!(sel.row(1.0, &block(), None).starts_with("1.000,1000.00,"));
+        assert_eq!(sel.header(None).split(',').count(), LIVE_CHANNELS.len() + 5);
+        assert!(sel
+            .row(1.0, &block(), None, &Extras::default())
+            .starts_with("1.000,1000.00,"));
     }
 
     #[test]
@@ -176,15 +226,22 @@ mod tests {
         sel.set_all(false);
         sel.channels[0] = true;
         assert_eq!(sel.header(None), "time_s,Engine speed (rpm)");
-        assert_eq!(sel.row(0.5, &block(), None), "0.500,1000.00");
+        assert_eq!(
+            sel.row(0.5, &block(), None, &Extras::default()),
+            "0.500,1000.00"
+        );
     }
 
     #[test]
     fn raw_only() {
         let mut sel = Selection::default();
-        sel.channels.fill(false);
+        sel.set_all(false);
+        sel.raw = true;
         assert_eq!(sel.header(None), "time_s,raw_hex");
-        assert_eq!(sel.row(0.0, &[0x03, 0xE8], None), "0.000,03 E8");
+        assert_eq!(
+            sel.row(0.0, &[0x03, 0xE8], None, &Extras::default()),
+            "0.000,03 E8"
+        );
     }
 
     #[test]
@@ -215,6 +272,28 @@ mod tests {
     }
 
     #[test]
+    fn knock_and_events_columns() {
+        let mut sel = Selection::default();
+        sel.set_all(false);
+        sel.knock = true;
+        sel.events = true;
+        assert_eq!(
+            sel.header(None),
+            "time_s,Knock (raw),Knock reply (hex),Fault events"
+        );
+        let events = ["new fault 240 Misfire, cylinder 3".to_string()];
+        let extras = Extras {
+            knock: Some(&[3, 0]),
+            events: &events,
+        };
+        assert_eq!(
+            sel.row(1.0, &[], None, &extras),
+            "1.000,3,03 00,\"new fault 240 Misfire, cylinder 3\""
+        );
+        assert_eq!(sel.row(1.0, &[], None, &Extras::default()), "1.000,,,");
+    }
+
+    #[test]
     fn vanos_column_written_as_one_or_zero() {
         let mut sel = Selection::default();
         sel.set_all(false);
@@ -224,7 +303,13 @@ mod tests {
             invert: false,
         };
         assert_eq!(sel.header(Some(flag)), "time_s,VANOS (on/off)");
-        assert_eq!(sel.row(0.0, &[0, 1], Some(flag)), "0.000,1");
-        assert_eq!(sel.row(0.0, &[0, 0], Some(flag)), "0.000,0");
+        assert_eq!(
+            sel.row(0.0, &[0, 1], Some(flag), &Extras::default()),
+            "0.000,1"
+        );
+        assert_eq!(
+            sel.row(0.0, &[0, 0], Some(flag), &Extras::default()),
+            "0.000,0"
+        );
     }
 }

@@ -249,6 +249,30 @@ impl Flag {
     }
 }
 
+/// Request for the "global knock retard" group (0B 93). From a forum report
+/// that MS41s answer it in BMW's INPA/TESTO tools. The reply's layout and units
+/// are UNVERIFIED, so it's shown and recorded as raw bytes for now.
+pub const KNOCK_REQUEST: [u8; 2] = [0x0B, 0x93];
+
+/// Reads the knock retard group (everything after the status byte).
+pub fn read_knock<T: Transport>(session: &mut Session<T>) -> Result<Vec<u8>, SessionError> {
+    session.request_ok(DME_ADDRESS, &KNOCK_REQUEST)
+}
+
+/// The cylinder (1-6) a misfire fault code (238-243) refers to.
+pub fn misfire_cylinder(code: u8) -> Option<u8> {
+    (238..=243).contains(&code).then(|| code - 237)
+}
+
+/// The knock sensor (1: cylinders 1-3, 2: cylinders 4-6) a fault code refers to.
+pub fn knock_sensor(code: u8) -> Option<u8> {
+    match code {
+        57 => Some(1),
+        59 => Some(2),
+        _ => None,
+    }
+}
+
 /// Reads the raw live data block (everything after the status byte).
 pub fn read_live<T: Transport>(session: &mut Session<T>) -> Result<Vec<u8>, SessionError> {
     session.request_ok(DME_ADDRESS, &LIVE_REQUEST)
@@ -374,6 +398,24 @@ mod tests {
         );
         assert_eq!(Flag { bit: None, ..bit3 }.decode(&data), Some(true));
         assert_eq!(Flag { offset: 5, ..bit3 }.decode(&data), None);
+    }
+
+    #[test]
+    fn recognises_misfire_and_knock_sensor_codes() {
+        assert_eq!(misfire_cylinder(238), Some(1));
+        assert_eq!(misfire_cylinder(243), Some(6));
+        assert_eq!(misfire_cylinder(237), None);
+        assert_eq!(misfire_cylinder(244), None);
+        assert_eq!(knock_sensor(57), Some(1));
+        assert_eq!(knock_sensor(59), Some(2));
+        assert_eq!(knock_sensor(58), None);
+    }
+
+    #[test]
+    fn read_knock_over_mock_ecu() {
+        let mock =
+            MockTransport::new(true).expect([0x12, 0x05, 0x0B, 0x93, 0x8F], reply(&[0xA0, 7, 0]));
+        assert_eq!(read_knock(&mut Session::new(mock)).unwrap(), vec![7, 0]);
     }
 
     #[test]

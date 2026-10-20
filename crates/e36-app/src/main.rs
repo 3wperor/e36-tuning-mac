@@ -1,5 +1,6 @@
 //! Live data window for the E36 MS41 DME.
 
+mod knock;
 mod recorder;
 mod vanos;
 mod worker;
@@ -13,7 +14,8 @@ use ds2::LinkStats;
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
-use recorder::{Recorder, Selection};
+use knock::KnockView;
+use recorder::{Extras, Recorder, Selection};
 use vanos::VanosView;
 use worker::{Command, Event, Source, Worker};
 
@@ -25,6 +27,8 @@ const HIGHLIGHT: Duration = Duration::from_millis(1500);
 const KEY_EXCLUDED: &str = "excluded_channels";
 const KEY_RECORD_RAW: &str = "record_raw";
 const KEY_RECORD_VANOS: &str = "record_vanos";
+const KEY_RECORD_KNOCK: &str = "record_knock";
+const KEY_RECORD_EVENTS: &str = "record_events";
 const KEY_VANOS_SOURCE: &str = "vanos_source";
 
 fn main() -> eframe::Result {
@@ -45,6 +49,9 @@ fn main() -> eframe::Result {
                 let raw = eframe::get_value(storage, KEY_RECORD_RAW).unwrap_or(true);
                 app.selection = Selection::from_excluded(&excluded, raw);
                 app.selection.vanos = eframe::get_value(storage, KEY_RECORD_VANOS).unwrap_or(true);
+                app.selection.knock = eframe::get_value(storage, KEY_RECORD_KNOCK).unwrap_or(true);
+                app.selection.events =
+                    eframe::get_value(storage, KEY_RECORD_EVENTS).unwrap_or(true);
                 let source: Option<(usize, Option<u8>, bool)> =
                     eframe::get_value(storage, KEY_VANOS_SOURCE).flatten();
                 app.vanos.source = source.map(|(offset, bit, invert)| ms41::Flag {
@@ -72,6 +79,7 @@ enum Tab {
     Raw,
     Faults,
     Vanos,
+    Knock,
     Recording,
 }
 
@@ -109,6 +117,9 @@ struct App {
     recorder: Option<Recorder>,
     selection: Selection,
     vanos: VanosView,
+    knock: KnockView,
+    /// Fault events not yet written to the recording.
+    pending_events: Vec<String>,
     tab: Tab,
 }
 
@@ -136,6 +147,8 @@ impl App {
             recorder: None,
             selection: Selection::default(),
             vanos: VanosView::new(None),
+            knock: KnockView::default(),
+            pending_events: Vec::new(),
             tab: Tab::Live,
         };
         app.refresh_ports();
@@ -178,6 +191,8 @@ impl App {
         self.live = None;
         self.history.clear();
         self.vanos.reset();
+        self.knock.reset();
+        self.pending_events.clear();
         self.faults = None;
     }
 
@@ -208,7 +223,21 @@ impl App {
             }
             Event::Live(at, data) => self.on_live(at, data),
             Event::LiveUnsupported(msg) => self.live_note = Some(msg),
-            Event::Faults(raw) => self.faults = Some(raw),
+            Event::Knock(at, data) => self.knock.on_knock(at, data),
+            Event::KnockUnsupported(msg) => self.knock.unsupported = Some(msg),
+            Event::Faults(raw) => {
+                let rpm = self
+                    .live
+                    .as_deref()
+                    .and_then(|d| ms41::ENGINE_SPEED.decode(d));
+                let new = self.knock.on_faults(Instant::now(), &raw, rpm);
+                if let Some(e) = new.first() {
+                    self.status = Some(format!("Fault watch: {}", e.text()));
+                }
+                let texts: Vec<String> = new.iter().map(|e| e.text()).collect();
+                self.pending_events.extend(texts);
+                self.faults = Some(raw);
+            }
             Event::FaultsCleared => {
                 self.status = Some("Fault memory cleared.".into());
                 if let Some(w) = &self.worker {
@@ -237,7 +266,13 @@ impl App {
             }
         }
         if let Some(rec) = &mut self.recorder {
-            if let Err(e) = rec.write(at, &data) {
+            let extras = Extras {
+                knock: self.knock.latest(),
+                events: &self.pending_events,
+            };
+            let result = rec.write(at, &data, &extras);
+            self.pending_events.clear();
+            if let Err(e) = result {
                 self.status = Some(format!("recording stopped: {e}"));
                 self.recorder = None;
             }
@@ -479,6 +514,11 @@ impl App {
                 egui::Checkbox::new(&mut self.selection.vanos, "VANOS (on/off)"),
             )
             .on_disabled_hover_text("Pick the VANOS bit in the VANOS tab first");
+            ui.checkbox(&mut self.selection.knock, "Knock retard (raw)");
+            ui.checkbox(
+                &mut self.selection.events,
+                "Fault events (codes appearing or clearing)",
+            );
             ui.checkbox(&mut self.selection.raw, "Raw data block (all bytes)")
                 .on_hover_text(
                     "Every byte the ECU sends. Keep this on for now: it's how we find \
@@ -603,6 +643,8 @@ impl eframe::App for App {
         eframe::set_value(storage, KEY_EXCLUDED, &self.selection.excluded());
         eframe::set_value(storage, KEY_RECORD_RAW, &self.selection.raw);
         eframe::set_value(storage, KEY_RECORD_VANOS, &self.selection.vanos);
+        eframe::set_value(storage, KEY_RECORD_KNOCK, &self.selection.knock);
+        eframe::set_value(storage, KEY_RECORD_EVENTS, &self.selection.events);
         let source = self.vanos.source.map(|f| (f.offset, f.bit, f.invert));
         eframe::set_value(storage, KEY_VANOS_SOURCE, &source);
     }
@@ -641,6 +683,7 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.tab, Tab::Raw, "Raw bytes");
                 ui.selectable_value(&mut self.tab, Tab::Faults, "Faults");
                 ui.selectable_value(&mut self.tab, Tab::Vanos, "VANOS");
+                ui.selectable_value(&mut self.tab, Tab::Knock, "Knock & misfire");
                 ui.selectable_value(&mut self.tab, Tab::Recording, "Recording");
             });
             ui.separator();
@@ -655,6 +698,7 @@ impl eframe::App for App {
                     self.live.as_deref(),
                     self.demo,
                 ),
+                Tab::Knock => self.knock.ui(ui, &self.history, self.connected_at),
                 Tab::Recording => self.recording_tab(ui),
             });
         });

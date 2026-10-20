@@ -10,7 +10,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ds2::serial::{LineOptions, SerialTransport};
-use ds2::{ms41, LinkStats, LivePoller, Pacing, Session, SessionError, SimulatedEcu, Transport};
+use ds2::{
+    ms41, LinkStats, LivePoller, Pacing, Session, SessionError, SimulatedEcu, Status, Transport,
+};
 
 /// Reopen the port after this many failed live reads in a row. With the
 /// poller backing off, that's several seconds without a single good reply.
@@ -19,6 +21,14 @@ const RECONNECT_AFTER: u32 = 15;
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// How often link stats are sent to the UI.
 const STATS_EVERY: Duration = Duration::from_millis(500);
+/// How often the knock retard group is read, between live reads.
+const KNOCK_EVERY: Duration = Duration::from_secs(1);
+/// How often the fault memory is re-read to catch new codes (misfire, knock
+/// sensor, ...) while logging.
+const FAULTS_EVERY: Duration = Duration::from_secs(15);
+/// Outright refusals of the knock request, before it ever worked, that mean
+/// this ECU doesn't support it.
+const KNOCK_REFUSALS: u32 = 3;
 /// Attempts at reading the ident before a connection counts as failed.
 const IDENT_ATTEMPTS: u32 = 3;
 
@@ -38,6 +48,8 @@ pub enum Event {
     Connected(ms41::Ident),
     Live(Instant, Vec<u8>),
     LiveUnsupported(String),
+    Knock(Instant, Vec<u8>),
+    KnockUnsupported(String),
     Link(LinkStats),
     Reconnecting(String),
     Faults(Vec<u8>),
@@ -164,6 +176,10 @@ fn poll_loop(
     let mut poller = LivePoller::new(Pacing::default());
     let mut live_paused = false;
     let mut last_stats = Instant::now();
+    let mut last_knock: Option<Instant> = None;
+    let mut knock = KnockState::Trying { refusals: 0 };
+    // `None`: check the fault memory straight away for a baseline.
+    let mut last_faults: Option<Instant> = None;
     loop {
         match commands.try_recv() {
             Ok(Command::Disconnect) | Err(TryRecvError::Disconnected) => return Exit::Quit,
@@ -194,11 +210,56 @@ fn poll_loop(
                 }
             }
         }
+
+        if knock != KnockState::Unsupported && last_knock.is_none_or(|t| t.elapsed() >= KNOCK_EVERY)
+        {
+            last_knock = Some(Instant::now());
+            match poller.run(session, ms41::read_knock) {
+                Ok(data) => {
+                    knock = KnockState::Working;
+                    send(Event::Knock(Instant::now(), data));
+                }
+                Err(SessionError::Io(e)) => return Exit::Reconnect(format!("cable problem: {e}")),
+                Err(SessionError::Negative(status)) if status != Status::Busy => {
+                    if let KnockState::Trying { refusals } = &mut knock {
+                        *refusals += 1;
+                        if *refusals >= KNOCK_REFUSALS {
+                            knock = KnockState::Unsupported;
+                            send(Event::KnockUnsupported(format!(
+                                "the ECU answered {status} to the knock request"
+                            )));
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+
+        if last_faults.is_none_or(|t| t.elapsed() >= FAULTS_EVERY) {
+            last_faults = Some(Instant::now());
+            match poller.run(session, ms41::read_faults) {
+                Ok(f) => send(Event::Faults(f.raw)),
+                Err(SessionError::Io(e)) => return Exit::Reconnect(format!("cable problem: {e}")),
+                // Try again at the next check.
+                Err(_) => {}
+            }
+        }
+
         if last_stats.elapsed() >= STATS_EVERY {
             last_stats = Instant::now();
             send(Event::Link(poller.stats().clone()));
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnockState {
+    /// Not answered yet; counting outright refusals.
+    Trying {
+        refusals: u32,
+    },
+    Working,
+    Unsupported,
 }
 
 /// Sleeps for `delay`, returning early with `true` if the user disconnects.

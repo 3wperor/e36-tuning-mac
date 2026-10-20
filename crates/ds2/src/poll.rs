@@ -113,12 +113,27 @@ impl LivePoller {
         &mut self,
         session: &mut Session<T>,
     ) -> Result<Vec<u8>, SessionError> {
+        let result = self.run(session, ms41::read_live);
+        match &result {
+            Ok(_) => self.ever_ok = true,
+            Err(SessionError::Negative(status)) if *status != Status::Busy => self.refusals += 1,
+            Err(_) => {}
+        }
+        result
+    }
+
+    /// Runs any other request (knock, faults, ...) under the same pacing, so
+    /// extra requests interleaved with live data don't overload the ECU.
+    pub fn run<T: Transport, R>(
+        &mut self,
+        session: &mut Session<T>,
+        request: impl FnOnce(&mut Session<T>) -> Result<R, SessionError>,
+    ) -> Result<R, SessionError> {
         session.set_gap(self.gap);
-        let result = ms41::read_live(session);
+        let result = request(session);
         let mut needed_time = false;
         match &result {
             Ok(_) => {
-                self.ever_ok = true;
                 self.stats.good += 1;
                 self.stats.consecutive_failures = 0;
             }
@@ -130,11 +145,6 @@ impl LivePoller {
                     e,
                     SessionError::Negative(Status::Busy) | SessionError::NoResponse
                 );
-                if let SessionError::Negative(status) = e {
-                    if *status != Status::Busy {
-                        self.refusals += 1;
-                    }
-                }
             }
         }
         self.adjust(needed_time);

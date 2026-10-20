@@ -6,7 +6,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use crate::frame::Frame;
-use crate::ms41::{cmd, Flag, DME_ADDRESS, LIVE_CHANNELS, LIVE_REQUEST};
+use crate::ms41::{cmd, Flag, DME_ADDRESS, KNOCK_REQUEST, LIVE_CHANNELS, LIVE_REQUEST};
 use crate::transport::Transport;
 
 const LIVE_BLOCK_LEN: usize = 32;
@@ -18,6 +18,9 @@ pub const SIM_VANOS: Flag = Flag {
     bit: Some(3),
     invert: false,
 };
+/// When the simulator's pretend misfire (cylinder 3) shows up in its faults.
+const SIM_MISFIRE_AFTER: Duration = Duration::from_secs(20);
+
 /// One byte at 9600 baud, 8E1 (11 bits).
 const BYTE_TIME: Duration = Duration::from_micros(1146);
 
@@ -32,6 +35,8 @@ pub struct SimulatedEcu {
     /// Answer busy to requests that come sooner than this after the last one.
     needs_gap: Option<Duration>,
     last_request: Option<Instant>,
+    /// Whether the pretend misfire is still to come.
+    misfire_pending: bool,
 }
 
 impl Default for SimulatedEcu {
@@ -55,6 +60,7 @@ impl SimulatedEcu {
             realtime: true,
             needs_gap: None,
             last_request: None,
+            misfire_pending: true,
         }
     }
 
@@ -87,9 +93,13 @@ impl SimulatedEcu {
         Some(*x % 100)
     }
 
+    fn rpm(&self) -> f64 {
+        800.0 + (1.0 - (self.start.elapsed().as_secs_f64() * 0.6).cos()) * 1800.0
+    }
+
     fn live_block(&self) -> Vec<u8> {
         let t = self.start.elapsed().as_secs_f64();
-        let rpm = 800.0 + (1.0 - (t * 0.6).cos()) * 1800.0;
+        let rpm = self.rpm();
         let coolant = 20.0 + 70.0 * (1.0 - (-t / 40.0).exp());
         let values = [rpm, 24.0 + (t * 0.1).sin(), coolant, 8.0 + rpm / 250.0];
         let mut data = vec![0u8; LIVE_BLOCK_LEN];
@@ -109,7 +119,19 @@ impl SimulatedEcu {
     fn reply_to(&mut self, payload: &[u8]) -> Vec<u8> {
         match payload {
             [cmd::IDENT] => [&[0xA0][..], b"1429861", &[0x00, 0x00]].concat(),
-            [cmd::READ_FAULTS] | [cmd::READ_FAULTS, 0x01] => [&[0xA0][..], &self.faults].concat(),
+            [cmd::READ_FAULTS] | [cmd::READ_FAULTS, 0x01] => {
+                if self.misfire_pending && self.start.elapsed() >= SIM_MISFIRE_AFTER {
+                    self.misfire_pending = false;
+                    self.faults[0] += 1;
+                    self.faults.extend([240, 0x21, 0x01, 0, 0, 0, 0, 0]);
+                }
+                [&[0xA0][..], &self.faults].concat()
+            }
+            p if p == KNOCK_REQUEST => {
+                // Pretend knock retard near the top of the rev range.
+                let retard = ((self.rpm() - 3800.0) / 100.0).clamp(0.0, 8.0) as u8;
+                vec![0xA0, retard, 0x00]
+            }
             [cmd::CLEAR_FAULTS] => {
                 self.faults = vec![0x00];
                 vec![0xA0]

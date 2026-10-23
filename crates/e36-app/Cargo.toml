@@ -9,3 +9,4 @@ repository.workspace = true
 ds2 = { path = "../ds2", features = ["serial"] }
 eframe = { version = "0.36", features = ["persistence"] }
 egui_plot = "0.37"
+tunesim = { path = "../tunesim" }

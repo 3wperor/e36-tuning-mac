@@ -1,6 +1,7 @@
 //! Live data window for the E36 MS41 DME.
 
 mod knock;
+mod practice;
 mod recorder;
 mod vanos;
 mod worker;
@@ -15,6 +16,7 @@ use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
 use knock::KnockView;
+use practice::Practice;
 use recorder::{Extras, Recorder, Selection};
 use vanos::VanosView;
 use worker::{Command, Event, Source, Worker};
@@ -81,6 +83,7 @@ enum Tab {
     Vanos,
     Knock,
     Recording,
+    Practice,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -118,6 +121,7 @@ struct App {
     selection: Selection,
     vanos: VanosView,
     knock: KnockView,
+    practice: Practice,
     /// Fault events not yet written to the recording.
     pending_events: Vec<String>,
     tab: Tab,
@@ -148,6 +152,7 @@ impl App {
             selection: Selection::default(),
             vanos: VanosView::new(None),
             knock: KnockView::default(),
+            practice: Practice::new(),
             pending_events: Vec::new(),
             tab: Tab::Live,
         };
@@ -685,6 +690,7 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.tab, Tab::Vanos, "VANOS");
                 ui.selectable_value(&mut self.tab, Tab::Knock, "Knock & misfire");
                 ui.selectable_value(&mut self.tab, Tab::Recording, "Recording");
+                ui.selectable_value(&mut self.tab, Tab::Practice, "Tuning practice");
             });
             ui.separator();
             egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
@@ -700,6 +706,7 @@ impl eframe::App for App {
                 ),
                 Tab::Knock => self.knock.ui(ui, &self.history, self.connected_at),
                 Tab::Recording => self.recording_tab(ui),
+                Tab::Practice => self.practice.ui(ui),
             });
         });
 

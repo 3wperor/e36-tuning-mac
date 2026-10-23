@@ -61,6 +61,26 @@ The tools pace themselves, retry errors and reconnect on their own; see
 - **Record CSV** saves a log to `~/Documents/e36-logs/`. It opens in Numbers,
   Excel or MegaLogViewer.
 
+## Tuning practice
+
+![Tuning practice](docs/practice.png)
+
+The **Tuning practice** tab is a simulated M52 engine for learning to tune
+without risking the real one. It never talks to the car and works without a
+cable. Edit the fuel and ignition maps, run a simulated dyno pull, and see AFR,
+power, torque and knock against RPM, with your previous run shown for
+comparison. Scenarios, each with a task, hints and pass/fail checks:
+
+1. **Lean at the top end**: correct fuel from wideband readings
+   (new fuel = old × measured AFR / target), and see lean mixtures knock.
+2. **Too much timing**: remove knock without throwing away power.
+3. **Vacuum leak**: read fuel trims, pick the right fix, then simulate the repair.
+4. **Bigger injectors**: scale a whole table.
+5. **Free practice**: a healthy engine to experiment with.
+
+The engine model is simplified but behaves the right way round; its numbers
+are plausible for an M52B25, not measurements of one.
+
 Why "unverified": the request for live data (`12 05 0B 03 1F`) is well
 documented, but where each value sits in the reply, and how it is scaled, only
 comes from forum code. It also differs between MS41 versions. A short

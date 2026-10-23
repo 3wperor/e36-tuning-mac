@@ -1,0 +1,8 @@
+[package]
+name = "tunesim"
+description = "A simulated BMW M52 engine for practising MS41-style tuning; never talks to a car"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]

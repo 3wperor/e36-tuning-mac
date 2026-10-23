@@ -26,6 +26,7 @@ exact variant is still unknown; `e36 ident` reads it from the car.
 | Flasher | Identity check, full backup, erase, write, verify | step 4 |
 | Analysis | Fuel trim and wideband correction suggestions, knock per cylinder | step 5 |
 | GUI | Native window using egui (`crates/e36-app`) | first version done |
+| Tuning practice | Simulated M52 (`crates/tunesim`) with editable fuel/ignition maps, dyno pull, fuel trims, five scenarios with checks | done; the map editor is the starting point for real map editing in step 3 |
 
 ## Build order
 

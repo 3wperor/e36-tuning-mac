@@ -6,6 +6,8 @@
 //! fuel means a richer mixture, lean mixtures knock sooner, too much timing
 //! knocks and the ECU pulls it back, too little timing loses power, and a
 //! vacuum leak shows up as big positive fuel trims at idle that fade with load.
+//! VANOS (the M52's on/off intake cam adjuster) helps mid-range torque and
+//! hurts the top end and the idle; ITB runner length moves the torque peak.
 //! The numbers are plausible for an M52B25, not measurements of one.
 //!
 //! - [`Table`]: a fuel or ignition map (RPM across, load down)
@@ -36,6 +38,12 @@ const FUEL_K: f64 = 13.0;
 const TORQUE_K: f64 = 270.0;
 /// How much the ECU pulls beyond the knock threshold when it hears knock.
 const KNOCK_PULL: f64 = 3.0;
+/// Intake port length in the M52 head, added to an ITB runner's length.
+pub const HEAD_PORT_MM: f64 = 150.0;
+/// ITB runner lengths the practice slider allows.
+pub const RUNNER_RANGE_MM: (f64, f64) = (100.0, 450.0);
+/// Rule of thumb for pulse tuning: total intake length (mm) × tuned RPM.
+const PULSE_K: f64 = 2_200_000.0;
 
 /// A map: one value per (load row, RPM column).
 #[derive(Debug, Clone, PartialEq)]
@@ -111,6 +119,8 @@ pub struct Tune {
     pub fuel: Table,
     /// Ignition advance in degrees before top dead centre.
     pub ignition: Table,
+    /// VANOS switch map: 1 = on (intake cam advanced), 0 = off.
+    pub vanos: Table,
 }
 
 /// Things about the engine itself, which no map change can fix.
@@ -122,6 +132,11 @@ pub struct Engine {
     /// How much fuel the injectors actually flow compared with what the maps
     /// were made for (1.2 = 20% bigger injectors).
     pub injector_flow: f64,
+    /// Individual throttle bodies with this runner length (mm), instead of
+    /// the standard intake. ITBs have no air flow meter, so the ECU fuels from
+    /// throttle position and RPM ("alpha-N"): when breathing changes, the
+    /// fuel map has to change with it.
+    pub itb_runner_mm: Option<f64>,
 }
 
 impl Default for Engine {
@@ -129,20 +144,74 @@ impl Default for Engine {
         Self {
             vacuum_leak: 0.0,
             injector_flow: 1.0,
+            itb_runner_mm: None,
         }
     }
 }
 
-// The engine's hidden physics. Practice never shows these directly.
-
-/// Volumetric efficiency: how well the engine breathes at each speed.
-fn ve(rpm: f64) -> f64 {
-    0.72 + 0.20 * (-((rpm - 4100.0) / 2300.0).powi(2)).exp()
-        - 0.10 * ((rpm - 5000.0) / 1500.0).max(0.0).powi(2)
+/// The RPM an ITB runner length is pulse-tuned for (rule of thumb): the
+/// pressure wave bouncing back up the runner arrives just as the valve is
+/// closing, packing in extra air. Shorter runners tune higher.
+pub fn itb_tuned_rpm(runner_mm: f64) -> f64 {
+    PULSE_K / (runner_mm + HEAD_PORT_MM)
 }
 
-fn airflow(rpm: f64, load: f64) -> f64 {
-    ve(rpm) * load / 100.0
+// The engine's hidden physics. Practice never shows these directly.
+
+fn bell(x: f64, centre: f64, width: f64) -> f64 {
+    (-((x - centre) / width).powi(2)).exp()
+}
+
+/// Volumetric efficiency (how well the engine breathes) of the intake alone.
+fn intake_ve(engine: &Engine, rpm: f64) -> f64 {
+    let top_end_falloff = 0.10 * ((rpm - 5000.0) / 1500.0).max(0.0).powi(2);
+    match engine.itb_runner_mm {
+        None => 0.72 + 0.20 * bell(rpm, 4100.0, 2300.0) - top_end_falloff,
+        Some(runner) => {
+            let tuned = itb_tuned_rpm(runner);
+            // A strong peak where the runners are tuned, a smaller one from
+            // the next harmonic, and weaker torque away from them.
+            0.66 + 0.04 * rpm / 6500.0
+                + 0.18 * bell(rpm, tuned, 1600.0)
+                + 0.04 * bell(rpm, 0.65 * tuned, 900.0)
+                - top_end_falloff
+        }
+    }
+}
+
+/// What VANOS adds: an advanced intake cam fills the cylinders better in the
+/// mid-range but runs out of breath at high RPM.
+fn vanos_ve(rpm: f64, on: bool) -> f64 {
+    if on {
+        0.06 * bell(rpm, 3000.0, 1300.0) - 0.07 * ((rpm - 4500.0) / 2000.0).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn ve(engine: &Engine, rpm: f64, vanos_on: bool) -> f64 {
+    intake_ve(engine, rpm) + vanos_ve(rpm, vanos_on)
+}
+
+/// Where the standard map switches VANOS on.
+fn stock_vanos(rpm: f64, load: f64) -> bool {
+    (1500.0..=4500.0).contains(&rpm) && load >= 20.0
+}
+
+/// Load at or below which VANOS should be off: the extra valve overlap of an
+/// advanced cam makes the idle lumpy.
+const ROUGH_IDLE_LOAD: f64 = 15.0;
+
+/// Airflow of the standard engine with the standard maps.
+fn stock_airflow(rpm: f64, load: f64) -> f64 {
+    ve(&Engine::default(), rpm, stock_vanos(rpm, load)) * load / 100.0
+}
+
+/// The airflow the standard fuel map was made for, blended between cells
+/// exactly as the fuel map is.
+fn stock_airflow_map() -> &'static Table {
+    static MAP: std::sync::OnceLock<Table> = std::sync::OnceLock::new();
+    MAP.get_or_init(|| Table::from_fn(stock_airflow))
 }
 
 /// Ignition advance that gives the most torque.
@@ -186,7 +255,7 @@ pub fn stock_tune() -> Tune {
     Tune {
         fuel: Table::from_fn(|rpm, load| {
             round_to(
-                FUEL_K * airflow(rpm, load) * STOICH / stock_target_afr(rpm, load),
+                FUEL_K * stock_airflow(rpm, load) * STOICH / stock_target_afr(rpm, load),
                 0.01,
             )
         }),
@@ -197,6 +266,7 @@ pub fn stock_tune() -> Tune {
                 0.5,
             )
         }),
+        vanos: Table::from_fn(|rpm, load| if stock_vanos(rpm, load) { 1.0 } else { 0.0 }),
     }
 }
 
@@ -210,6 +280,10 @@ pub struct Sample {
     pub closed_loop: bool,
     /// Closed-loop fuel trim the ECU applied (+0.10 = adding 10%).
     pub trim: f64,
+    /// VANOS on (intake cam advanced).
+    pub vanos: bool,
+    /// VANOS on at idle: too much valve overlap, so the idle is lumpy.
+    pub rough_idle: bool,
     /// Advance from the ignition map.
     pub timing_map: f64,
     /// How much the ECU pulled because it heard knock.
@@ -227,9 +301,18 @@ impl Sample {
 }
 
 pub fn simulate(engine: &Engine, tune: &Tune, rpm: f64, load: f64) -> Sample {
-    let air = airflow(rpm, load) + engine.vacuum_leak;
+    let vanos = tune.vanos.lookup(rpm, load) >= 0.5;
+    let breathing = ve(engine, rpm, vanos);
+    let air = breathing * load / 100.0 + engine.vacuum_leak;
     let needed = FUEL_K * air;
-    let base = tune.fuel.lookup(rpm, load) * engine.injector_flow;
+    // With the standard intake the air flow meter measures any change in
+    // breathing and the ECU adds fuel to match (a vacuum leak gets past it,
+    // though). ITBs fuel from throttle position, so nothing compensates.
+    let metered = match engine.itb_runner_mm {
+        None => breathing * load / 100.0 / stock_airflow_map().lookup(rpm, load),
+        Some(_) => 1.0,
+    };
+    let base = tune.fuel.lookup(rpm, load) * engine.injector_flow * metered;
     let closed_loop = is_closed_loop(rpm, load);
     let trim = if closed_loop {
         (needed / base - 1.0).clamp(-TRIM_LIMIT, TRIM_LIMIT)
@@ -249,19 +332,34 @@ pub fn simulate(engine: &Engine, tune: &Tune, rpm: f64, load: f64) -> Sample {
 
     let timing_eff = (1.0 - 0.0025 * (timing - best_timing(rpm, load)).powi(2)).max(0.5);
     let mixture_eff = (1.0 - 0.012 * (afr - POWER_AFR).powi(2)).max(0.5);
-    let torque_nm = TORQUE_K * air * timing_eff * mixture_eff;
+    let rough_idle = vanos && load <= ROUGH_IDLE_LOAD;
+    let idle_eff = if rough_idle { 0.85 } else { 1.0 };
+    let torque_nm = TORQUE_K * air * timing_eff * mixture_eff * idle_eff;
     Sample {
         rpm,
         load,
         afr,
         closed_loop,
         trim,
+        vanos,
+        rough_idle,
         timing_map,
         knock_retard,
         timing,
         torque_nm,
         power_bhp: torque_nm * rpm / 7120.9,
     }
+}
+
+/// The same pull with VANOS forced on, then forced off, to see where each
+/// cam position makes more torque.
+pub fn cam_comparison(engine: &Engine, tune: &Tune) -> (Vec<Sample>, Vec<Sample>) {
+    let forced = |on: f64| {
+        let mut t = tune.clone();
+        t.vanos.map(|_| on);
+        dyno_pull(engine, &t)
+    };
+    (forced(1.0), forced(0.0))
 }
 
 /// A full-throttle run from 1,500 to 6,500 rpm, like on a dyno.
@@ -326,6 +424,12 @@ pub enum Goal {
     TrimsWithin(f64),
     /// Average power at least this fraction of what the engine can safely make.
     KeepPower(f64),
+    /// VANOS off at idle.
+    SmoothIdle,
+    /// Peak power somewhere in this RPM range.
+    PeakPowerBetween(f64, f64),
+    /// Peak power of at least this many bhp.
+    PeakPowerAtLeast(f64),
 }
 
 pub struct Question {
@@ -354,6 +458,8 @@ pub fn scenarios() -> Vec<Scenario> {
         too_much_timing(),
         vacuum_leak(),
         bigger_injectors(),
+        vanos_switch_points(),
+        itb_conversion(),
         sandbox(),
     ]
 }
@@ -506,9 +612,76 @@ fn bigger_injectors() -> Scenario {
     }
 }
 
+fn vanos_switch_points() -> Scenario {
+    let mut tune = stock_tune();
+    tune.vanos.map(|_| 1.0);
+    Scenario {
+        title: "5. VANOS switch points",
+        story: "A previous owner set the VANOS map to 'always on'. The idle is lumpy and the \
+                engine runs out of breath at the top end.",
+        task: "Make the idle smooth and get average power back to at least 99% of what the \
+               engine can make.",
+        hints: &[
+            "VANOS on the M52 has two positions: ON advances the intake cam, OFF leaves it \
+             retarded. The VANOS map says which to use at each RPM and load.",
+            "Press 'Compare cam positions': it runs one pull with VANOS always on and one always \
+             off. Where the green (ON) torque line is higher, ON is better; where it drops below \
+             the grey (OFF) line, switch it off.",
+            "The idle is lumpy because an advanced cam gives more valve overlap, which a slow, \
+             lightly loaded engine hates. Turn VANOS off in the low-load cells (10% row).",
+            "Real maps switch at slightly different points going up and down the revs \
+             (hysteresis) so the solenoid doesn't flicker on and off; here one switch point is fine.",
+        ],
+        kind: Kind::Tuning,
+        engine: Engine::default(),
+        tune,
+        goals: &[Goal::SmoothIdle, Goal::KeepPower(0.99)],
+        question: None,
+    }
+}
+
+fn itb_conversion() -> Scenario {
+    Scenario {
+        title: "6. ITB conversion",
+        story: "Individual throttle bodies (ITBs) have been fitted in place of the standard \
+                intake. There's no air flow meter any more: the ECU now fuels from throttle \
+                position and RPM (alpha-N), using the old fuel map.",
+        task: "Choose a runner length that beats the standard intake (at least 180 bhp, peaking \
+               between 5,800 and 6,500 rpm), then retune full-throttle fuel: AFR 12.5–13.2 and \
+               no knock.",
+        hints: &[
+            "Move the runner length slider and run a pull each time. Shorter runners tune the \
+             intake for higher RPM; longer runners give more low-down torque but peak earlier.",
+            "The slider shows the RPM the runners are tuned for: the pressure wave bouncing back \
+             up the runner arrives just as the valve closes, packing in extra air.",
+            "Without an air flow meter nothing adjusts the fuel when the engine breathes \
+             differently. Wherever the engine now breathes better it runs lean, and where it \
+             breathes worse it runs rich.",
+            "Pick the runner length first, then select the 100% row and use 'Correct from last \
+             pull'. Changing the runners afterwards means retuning the fuel again.",
+            "Look at the everyday fuel trims: the O2 sensors are pulling fuel at part throttle \
+             too, because those cells are rich as well. On a real conversion you'd retune them \
+             next (it isn't needed to pass here).",
+        ],
+        kind: Kind::Tuning,
+        engine: Engine {
+            itb_runner_mm: Some(350.0),
+            ..Engine::default()
+        },
+        tune: stock_tune(),
+        goals: &[
+            Goal::PeakPowerAtLeast(180.0),
+            Goal::PeakPowerBetween(5800.0, 6500.0),
+            Goal::WotAfrInBand,
+            Goal::NoKnock,
+        ],
+        question: None,
+    }
+}
+
 fn sandbox() -> Scenario {
     Scenario {
-        title: "5. Free practice",
+        title: "7. Free practice",
         story: "A healthy standard engine with standard maps.",
         task: "Change anything and see what happens. Try adding timing until it knocks, or \
                leaning out the top end and watching the knock appear.",
@@ -609,8 +782,48 @@ pub fn assess(scenario: &Scenario, engine: &Engine, tune: &Tune) -> Vec<Check> {
                     ),
                 }
             }
+            Goal::SmoothIdle => {
+                let (_, idle) = snapshots(engine, tune)[0];
+                Check {
+                    ok: !idle.rough_idle,
+                    text: if idle.rough_idle {
+                        "Idle is lumpy: VANOS is on at idle.".into()
+                    } else {
+                        "Idle is smooth (VANOS off at idle).".into()
+                    },
+                }
+            }
+            Goal::PeakPowerAtLeast(bhp) => {
+                let peak = peak_power(&pull);
+                Check {
+                    ok: peak.power_bhp >= bhp,
+                    text: format!(
+                        "Peak power {:.0} bhp (needs at least {bhp:.0}; the standard intake makes \
+                         about 175).",
+                        peak.power_bhp
+                    ),
+                }
+            }
+            Goal::PeakPowerBetween(lo, hi) => {
+                let peak = peak_power(&pull);
+                Check {
+                    ok: (lo..=hi).contains(&peak.rpm),
+                    text: format!(
+                        "Peak power {:.0} bhp at {:.0} rpm (needs to be between {lo:.0} and \
+                         {hi:.0} rpm).",
+                        peak.power_bhp, peak.rpm
+                    ),
+                }
+            }
         })
         .collect()
+}
+
+fn peak_power(pull: &[Sample]) -> Sample {
+    *pull
+        .iter()
+        .max_by(|a, b| a.power_bhp.total_cmp(&b.power_bhp))
+        .expect("pull has samples")
 }
 
 fn band_error(afr: f64) -> f64 {
@@ -743,8 +956,95 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_has_no_goals() {
+    fn vanos_scenario_needs_idle_off_and_top_end_off() {
         let s = scenario(4);
+        let checks = assess(&s, &s.engine, &s.tune);
+        assert!(!checks[0].ok, "always-on should give a lumpy idle");
+        assert!(!checks[1].ok, "always-on should cost top-end power");
+
+        // Use the comparison to pick the better cam position at each RPM.
+        let (on, off) = cam_comparison(&s.engine, &s.tune);
+        let mut tune = s.tune.clone();
+        for (col, &rpm) in RPM_AXIS.iter().enumerate() {
+            let better_on = match (
+                on.iter().find(|p| p.rpm == rpm),
+                off.iter().find(|p| p.rpm == rpm),
+            ) {
+                (Some(a), Some(b)) => a.torque_nm > b.torque_nm,
+                _ => true,
+            };
+            for (row, &load) in LOAD_AXIS.iter().enumerate() {
+                let on = better_on && load > ROUGH_IDLE_LOAD;
+                tune.vanos.set(row, col, if on { 1.0 } else { 0.0 });
+            }
+        }
+        assert!(all_ok(&assess(&s, &s.engine, &tune)));
+    }
+
+    #[test]
+    fn vanos_helps_the_mid_range_and_hurts_the_top_end() {
+        let (on, off) = cam_comparison(&Engine::default(), &stock_tune());
+        let at = |pull: &[Sample], rpm: f64| pull.iter().find(|p| p.rpm == rpm).unwrap().torque_nm;
+        assert!(at(&on, 3000.0) > at(&off, 3000.0));
+        assert!(at(&on, 6000.0) < at(&off, 6000.0));
+    }
+
+    #[test]
+    fn air_flow_meter_hides_breathing_changes_but_itbs_do_not() {
+        let stock = stock_tune();
+        let mut all_off = stock.clone();
+        all_off.vanos.map(|_| 0.0);
+        let afr = |e: &Engine, t: &Tune| simulate(e, t, 3000.0, 100.0).afr;
+        let std_engine = Engine::default();
+        assert!((afr(&std_engine, &all_off) - POWER_AFR).abs() < 0.05);
+
+        let itb = Engine {
+            itb_runner_mm: Some(250.0),
+            ..Engine::default()
+        };
+        assert!((afr(&itb, &stock) - afr(&itb, &all_off)).abs() > 0.2);
+    }
+
+    #[test]
+    fn shorter_runners_tune_higher() {
+        assert!(itb_tuned_rpm(150.0) > itb_tuned_rpm(400.0));
+        let peak_at = |mm: f64| {
+            let e = Engine {
+                itb_runner_mm: Some(mm),
+                ..Engine::default()
+            };
+            peak_power(&dyno_pull(&e, &stock_tune())).rpm
+        };
+        assert!(peak_at(150.0) > peak_at(400.0));
+    }
+
+    #[test]
+    fn itb_scenario_passes_with_short_runners_and_retuned_fuel() {
+        let s = scenario(5);
+        assert!(!all_ok(&assess(&s, &s.engine, &s.tune)));
+        let engine = Engine {
+            itb_runner_mm: Some(200.0),
+            ..s.engine
+        };
+        let pull = dyno_pull(&engine, &s.tune);
+        let mut tune = s.tune.clone();
+        for (col, &rpm) in RPM_AXIS.iter().enumerate() {
+            if let Some(p) = pull.iter().find(|p| p.rpm == rpm) {
+                let v = tune.fuel.get(9, col) * fuel_correction(p.afr, POWER_AFR);
+                tune.fuel.set(9, col, v);
+            }
+        }
+        let checks = assess(&s, &engine, &tune);
+        assert!(
+            all_ok(&checks),
+            "{:?}",
+            checks.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sandbox_has_no_goals() {
+        let s = scenario(6);
         assert!(assess(&s, &s.engine, &s.tune).is_empty());
     }
 }

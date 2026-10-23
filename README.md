@@ -76,7 +76,16 @@ comparison. Scenarios, each with a task, hints and pass/fail checks:
 2. **Too much timing**: remove knock without throwing away power.
 3. **Vacuum leak**: read fuel trims, pick the right fix, then simulate the repair.
 4. **Bigger injectors**: scale a whole table.
-5. **Free practice**: a healthy engine to experiment with.
+5. **VANOS switch points**: edit the VANOS on/off map, and use "Compare cam
+   positions" (one pull with VANOS always on, one always off) to see where the
+   advanced cam helps and where to switch it off. VANOS on at idle makes it lumpy.
+6. **ITB conversion**: a runner length slider for pulse tuning (shorter runners
+   move the torque peak up the revs), and why ITBs, which fuel from throttle
+   position instead of an air flow meter, need the fuel map retuned whenever
+   breathing changes.
+7. **Free practice**: a healthy engine to experiment with.
+
+![VANOS practice](docs/practice-vanos.png)
 
 The engine model is simplified but behaves the right way round; its numbers
 are plausible for an M52B25, not measurements of one.

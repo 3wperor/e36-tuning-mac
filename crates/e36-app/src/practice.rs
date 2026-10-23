@@ -6,14 +6,17 @@ use std::collections::BTreeSet;
 use eframe::egui;
 use egui_plot::{HLine, Legend, Line, LineStyle, Plot, PlotPoints};
 use tunesim::{
-    assess, dyno_pull, fuel_correction, snapshots, Check, Engine, Kind, Sample, Scenario, Table,
-    Tune, LEAN_WARNING, LOAD_AXIS, POWER_AFR, RPM_AXIS, WOT_BAND,
+    assess, cam_comparison, dyno_pull, fuel_correction, itb_tuned_rpm, snapshots, Check, Engine,
+    Kind, Sample, Scenario, Table, Tune, HEAD_PORT_MM, LEAN_WARNING, LOAD_AXIS, POWER_AFR,
+    RPM_AXIS, RUNNER_RANGE_MM, WOT_BAND,
 };
 
 const PASS: egui::Color32 = egui::Color32::from_rgb(60, 180, 90);
 const FAIL: egui::Color32 = egui::Color32::from_rgb(230, 80, 60);
 const WARN: egui::Color32 = egui::Color32::from_rgb(230, 170, 40);
 const PREVIOUS: egui::Color32 = egui::Color32::from_gray(120);
+const VANOS_ON: egui::Color32 = egui::Color32::from_rgb(120, 200, 130);
+const VANOS_OFF: egui::Color32 = egui::Color32::from_gray(150);
 /// Undo steps kept.
 const MAX_UNDO: usize = 100;
 
@@ -21,6 +24,7 @@ const MAX_UNDO: usize = 100;
 enum Map {
     Fuel,
     Ignition,
+    Vanos,
 }
 
 enum Click {
@@ -38,6 +42,8 @@ pub struct Practice {
     map: Map,
     selected: BTreeSet<(usize, usize)>,
     pull: Option<Vec<Sample>>,
+    /// Pulls with VANOS forced on and forced off.
+    compare: Option<(Vec<Sample>, Vec<Sample>)>,
     previous: Option<Vec<Sample>>,
     checks: Option<Vec<Check>>,
     hints_shown: usize,
@@ -59,6 +65,7 @@ impl Practice {
             selected: BTreeSet::new(),
             pull: None,
             previous: None,
+            compare: None,
             checks: None,
             hints_shown: 0,
             answer: None,
@@ -79,6 +86,7 @@ impl Practice {
         self.selected.clear();
         self.pull = None;
         self.previous = None;
+        self.compare = None;
         self.checks = None;
         self.hints_shown = 0;
         self.answer = None;
@@ -106,6 +114,7 @@ impl Practice {
         match self.map {
             Map::Fuel => &self.tune.fuel,
             Map::Ignition => &self.tune.ignition,
+            Map::Vanos => &self.tune.vanos,
         }
     }
 
@@ -118,6 +127,7 @@ impl Practice {
         let table = match self.map {
             Map::Fuel => &mut self.tune.fuel,
             Map::Ignition => &mut self.tune.ignition,
+            Map::Vanos => &mut self.tune.vanos,
         };
         change(table, &self.selected);
     }
@@ -205,7 +215,15 @@ impl Practice {
         egui::Grid::new("practice_trims")
             .striped(true)
             .show(ui, |ui| {
-                for h in ["Condition", "RPM", "Load", "AFR", "Fuel trim", "Mode"] {
+                for h in [
+                    "Condition",
+                    "RPM",
+                    "Load",
+                    "AFR",
+                    "Fuel trim",
+                    "VANOS",
+                    "Mode",
+                ] {
                     ui.strong(h);
                 }
                 ui.end_row();
@@ -221,6 +239,11 @@ impl Practice {
                         ui.colored_label(WARN, trim);
                     } else {
                         ui.monospace(trim);
+                    }
+                    if s.rough_idle {
+                        ui.colored_label(FAIL, "ON (lumpy idle)");
+                    } else {
+                        ui.label(if s.vanos { "ON" } else { "off" });
                     }
                     ui.label(if s.closed_loop {
                         "closed loop (O2 sensors)"
@@ -281,6 +304,9 @@ impl Practice {
             .default_open(true)
             .show(ui, |ui| self.trims(ui));
         ui.add_space(6.0);
+        if let Some(mut mm) = self.engine.itb_runner_mm {
+            self.runner_slider(ui, &mut mm);
+        }
 
         ui.horizontal(|ui| {
             let before = self.map;
@@ -290,6 +316,7 @@ impl Practice {
                 Map::Ignition,
                 "Ignition map (degrees advance)",
             );
+            ui.selectable_value(&mut self.map, Map::Vanos, "VANOS map (on/off)");
             if self.map != before {
                 self.selected.clear();
             }
@@ -323,9 +350,54 @@ impl Practice {
                 ui.label(text);
             }
         });
+        if ui
+            .button("Compare cam positions")
+            .on_hover_text(
+                "Runs one pull with VANOS always on and one always off, to show where each cam \
+                 position makes more torque.",
+            )
+            .clicked()
+        {
+            self.compare = Some(cam_comparison(&self.engine(), &self.tune));
+        }
         if self.pull.is_some() {
             self.charts(ui);
         }
+        if let Some((on, off)) = &self.compare {
+            cam_chart(ui, on, off);
+        }
+    }
+
+    fn runner_slider(&mut self, ui: &mut egui::Ui, mm: &mut f64) {
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.label("ITB runner length");
+                let (lo, hi) = RUNNER_RANGE_MM;
+                if ui
+                    .add(egui::Slider::new(mm, lo..=hi).step_by(5.0).suffix(" mm"))
+                    .changed()
+                {
+                    self.engine.itb_runner_mm = Some(*mm);
+                    // Results were for the old runners.
+                    self.checks = None;
+                    self.compare = None;
+                }
+                ui.label(
+                    egui::RichText::new(format!("tuned for about {:.0} rpm", itb_tuned_rpm(*mm)))
+                        .strong(),
+                );
+            });
+            ui.label(
+                egui::RichText::new(format!(
+                    "Runner plus the {HEAD_PORT_MM:.0} mm port in the head. Shorter runners move \
+                     the torque peak up the revs; longer runners give more low-down torque. \
+                     Run a pull after each change."
+                ))
+                .small()
+                .weak(),
+            );
+        });
+        ui.add_space(6.0);
     }
 
     fn tools(&mut self, ui: &mut egui::Ui) {
@@ -335,7 +407,19 @@ impl Practice {
             let steps: &[(&str, f64)] = match self.map {
                 Map::Fuel => &[("-5%", -5.0), ("-1%", -1.0), ("+1%", 1.0), ("+5%", 5.0)],
                 Map::Ignition => &[("-2°", -2.0), ("-0.5°", -0.5), ("+0.5°", 0.5), ("+2°", 2.0)],
+                Map::Vanos => &[],
             };
+            if self.map == Map::Vanos {
+                for (label, value) in [("Turn ON", 1.0), ("Turn OFF", 0.0)] {
+                    if ui.add_enabled(any, egui::Button::new(label)).clicked() {
+                        self.edit(|t, sel| {
+                            for &(r, c) in sel {
+                                t.set(r, c, value);
+                            }
+                        });
+                    }
+                }
+            }
             for &(label, step) in steps {
                 if ui.add_enabled(any, egui::Button::new(label)).clicked() {
                     let fuel = self.map == Map::Fuel;
@@ -387,32 +471,34 @@ impl Practice {
             }
         });
         ui.horizontal_wrapped(|ui| {
-            let unit = if self.map == Map::Fuel { "%" } else { "°" };
-            ui.label(if self.map == Map::Fuel {
-                "Scale whole table by"
-            } else {
-                "Shift whole table by"
-            });
-            ui.add(
-                egui::DragValue::new(&mut self.scale_percent)
-                    .speed(0.1)
-                    .range(-50.0..=50.0)
-                    .suffix(unit),
-            );
-            if ui.button("Apply").clicked() {
-                let amount = self.scale_percent;
-                let fuel = self.map == Map::Fuel;
-                self.edit(|t, _| {
-                    t.map(|v| {
-                        if fuel {
-                            v * (1.0 + amount / 100.0)
-                        } else {
-                            v + amount
-                        }
-                    })
+            if self.map != Map::Vanos {
+                let unit = if self.map == Map::Fuel { "%" } else { "°" };
+                ui.label(if self.map == Map::Fuel {
+                    "Scale whole table by"
+                } else {
+                    "Shift whole table by"
                 });
+                ui.add(
+                    egui::DragValue::new(&mut self.scale_percent)
+                        .speed(0.1)
+                        .range(-50.0..=50.0)
+                        .suffix(unit),
+                );
+                if ui.button("Apply").clicked() {
+                    let amount = self.scale_percent;
+                    let fuel = self.map == Map::Fuel;
+                    self.edit(|t, _| {
+                        t.map(|v| {
+                            if fuel {
+                                v * (1.0 + amount / 100.0)
+                            } else {
+                                v + amount
+                            }
+                        })
+                    });
+                }
+                ui.separator();
             }
-            ui.separator();
             if ui
                 .add_enabled(!self.undo.is_empty(), egui::Button::new("Undo"))
                 .clicked()
@@ -428,6 +514,7 @@ impl Practice {
                     *t = match map {
                         Map::Fuel => start.fuel,
                         Map::Ignition => start.ignition,
+                        Map::Vanos => start.vanos,
                     }
                 });
             }
@@ -437,7 +524,8 @@ impl Practice {
     fn grid(&mut self, ui: &mut egui::Ui) {
         let table = self.table();
         let (lo, hi) = table.min_max();
-        let fuel = self.map == Map::Fuel;
+        let map = self.map;
+        let fuel = map == Map::Fuel;
         let mut click = None;
         egui::ScrollArea::horizontal()
             .id_salt("practice_grid")
@@ -458,10 +546,11 @@ impl Practice {
                             }
                             for c in 0..Table::COLS {
                                 let v = table.get(r, c);
-                                let text = if fuel {
-                                    format!("{v:.2}")
-                                } else {
-                                    format!("{v:.1}")
+                                let (text, fill) = match map {
+                                    Map::Fuel => (format!("{v:.2}"), heat(v, lo, hi)),
+                                    Map::Ignition => (format!("{v:.1}"), heat(v, lo, hi)),
+                                    Map::Vanos if v >= 0.5 => ("ON".into(), VANOS_ON),
+                                    Map::Vanos => ("off".into(), VANOS_OFF),
                                 };
                                 let mut button = egui::Button::new(
                                     egui::RichText::new(text)
@@ -469,7 +558,7 @@ impl Practice {
                                         .size(11.0)
                                         .color(egui::Color32::BLACK),
                                 )
-                                .fill(heat(v, lo, hi))
+                                .fill(fill)
                                 .min_size(egui::vec2(46.0, 20.0));
                                 if self.selected.contains(&(r, c)) {
                                     button =
@@ -481,7 +570,26 @@ impl Practice {
                             }
                             ui.end_row();
                         }
-                        if let Some(pull) = &self.pull {
+                        if let (Map::Vanos, Some((on, off))) = (map, &self.compare) {
+                            ui.label("Better at full throttle");
+                            for &rpm in &RPM_AXIS {
+                                let at = |p: &[Sample]| {
+                                    p.iter().find(|s| s.rpm == rpm).map(|s| s.torque_nm)
+                                };
+                                match (at(on), at(off)) {
+                                    (Some(a), Some(b)) if a > b => {
+                                        ui.colored_label(PASS, "ON");
+                                    }
+                                    (Some(_), Some(_)) => {
+                                        ui.label("OFF");
+                                    }
+                                    _ => {
+                                        ui.weak("—");
+                                    }
+                                }
+                            }
+                            ui.end_row();
+                        } else if let (false, Some(pull)) = (map == Map::Vanos, &self.pull) {
                             ui.label(if fuel {
                                 "AFR (last pull)"
                             } else {
@@ -610,6 +718,33 @@ impl Practice {
                 );
             });
     }
+}
+
+/// Torque with VANOS forced on and off, to find where to switch.
+fn cam_chart(ui: &mut egui::Ui, on: &[Sample], off: &[Sample]) {
+    ui.add_space(6.0);
+    ui.strong("Cam position comparison (full throttle)");
+    let torque = |p: &[Sample]| -> PlotPoints { p.iter().map(|s| [s.rpm, s.torque_nm]).collect() };
+    Plot::new("practice_cam")
+        .height(170.0)
+        .legend(Legend::default())
+        .x_axis_label("rpm")
+        .y_axis_label("torque (Nm)")
+        .y_axis_min_width(48.0)
+        .allow_drag(false)
+        .allow_scroll(false)
+        .show(ui, |plot| {
+            plot.line(Line::new("VANOS ON (cam advanced)", torque(on)).color(PASS));
+            plot.line(Line::new("VANOS OFF", torque(off)).color(PREVIOUS));
+        });
+    ui.label(
+        egui::RichText::new(
+            "Where the green line is higher, VANOS ON makes more torque. Switch it off where the \
+             lines cross, and keep it off at idle.",
+        )
+        .small()
+        .weak(),
+    );
 }
 
 fn all_cells() -> impl Iterator<Item = (usize, usize)> {

@@ -7,7 +7,9 @@
 //! knocks and the ECU pulls it back, too little timing loses power, and a
 //! vacuum leak shows up as big positive fuel trims at idle that fade with load.
 //! VANOS (the M52's on/off intake cam adjuster) helps mid-range torque and
-//! hurts the top end and the idle; ITB runner length moves the torque peak.
+//! hurts the top end and the idle; ITB runner and trumpet length move the
+//! torque peak, a bellmouth flare helps flow, and longer cam duration trades
+//! low-down torque and a smooth idle for top-end power.
 //! The numbers are plausible for an M52B25, not measurements of one.
 //!
 //! - [`Table`]: a fuel or ignition map (RPM across, load down)
@@ -44,6 +46,15 @@ pub const HEAD_PORT_MM: f64 = 150.0;
 pub const RUNNER_RANGE_MM: (f64, f64) = (100.0, 450.0);
 /// Rule of thumb for pulse tuning: total intake length (mm) × tuned RPM.
 const PULSE_K: f64 = 2_200_000.0;
+/// Trumpet lengths the practice slider allows.
+pub const TRUMPET_RANGE_MM: (f64, f64) = (0.0, 150.0);
+/// Baseline cam duration (degrees at 1 mm lift) the model treats as standard.
+/// Illustrative, not a measured M52 cam spec.
+pub const STOCK_CAM_DURATION: f64 = 228.0;
+/// Cam durations the practice slider allows.
+pub const CAM_RANGE: (f64, f64) = (220.0, 280.0);
+/// Durations above this give a lumpy idle from the extra valve overlap.
+pub const LUMPY_CAM_DURATION: f64 = 252.0;
 
 /// A map: one value per (load row, RPM column).
 #[derive(Debug, Clone, PartialEq)]
@@ -137,6 +148,12 @@ pub struct Engine {
     /// throttle position and RPM ("alpha-N"): when breathing changes, the
     /// fuel map has to change with it.
     pub itb_runner_mm: Option<f64>,
+    /// Trumpet (velocity stack) length on the ITBs, added to the runner.
+    pub trumpet_mm: f64,
+    /// Shape of the trumpet's mouth.
+    pub flare: Flare,
+    /// Cam duration in degrees (both cams, simplified).
+    pub cam_duration: f64,
 }
 
 impl Default for Engine {
@@ -145,8 +162,52 @@ impl Default for Engine {
             vacuum_leak: 0.0,
             injector_flow: 1.0,
             itb_runner_mm: None,
+            trumpet_mm: 0.0,
+            flare: Flare::Full,
+            cam_duration: STOCK_CAM_DURATION,
         }
     }
+}
+
+/// The mouth of an ITB trumpet. Air has to turn the corner into the pipe; a
+/// sharp edge makes it trip and lose flow, a rounded bell lets it in smoothly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flare {
+    /// Plain cut pipe.
+    None,
+    /// A small lip.
+    Small,
+    /// A full radiused bellmouth.
+    Full,
+}
+
+impl Flare {
+    pub const ALL: [Flare; 3] = [Flare::None, Flare::Small, Flare::Full];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Flare::None => "None (plain pipe)",
+            Flare::Small => "Small lip",
+            Flare::Full => "Full radius bellmouth",
+        }
+    }
+
+    /// Share of the possible airflow that gets in through this mouth.
+    fn flow(self) -> f64 {
+        match self {
+            Flare::None => 0.96,
+            Flare::Small => 0.985,
+            Flare::Full => 1.0,
+        }
+    }
+}
+
+/// The RPM an engine's ITBs are pulse-tuned for, counting runner, trumpet
+/// and the port in the head. `None` with the standard intake.
+pub fn intake_tuned_rpm(engine: &Engine) -> Option<f64> {
+    engine
+        .itb_runner_mm
+        .map(|runner| itb_tuned_rpm(runner + engine.trumpet_mm))
 }
 
 /// The RPM an ITB runner length is pulse-tuned for (rule of thumb): the
@@ -168,15 +229,24 @@ fn intake_ve(engine: &Engine, rpm: f64) -> f64 {
     match engine.itb_runner_mm {
         None => 0.72 + 0.20 * bell(rpm, 4100.0, 2300.0) - top_end_falloff,
         Some(runner) => {
-            let tuned = itb_tuned_rpm(runner);
+            let tuned = itb_tuned_rpm(runner + engine.trumpet_mm);
             // A strong peak where the runners are tuned, a smaller one from
             // the next harmonic, and weaker torque away from them.
-            0.66 + 0.04 * rpm / 6500.0
+            (0.66
+                + 0.04 * rpm / 6500.0
                 + 0.18 * bell(rpm, tuned, 1600.0)
                 + 0.04 * bell(rpm, 0.65 * tuned, 900.0)
-                - top_end_falloff
+                - top_end_falloff)
+                * engine.flare.flow()
         }
     }
+}
+
+/// Longer cam duration keeps the valves open longer: better breathing at
+/// high RPM, worse at low RPM.
+fn cam_factor(duration: f64, rpm: f64) -> f64 {
+    let extra = duration - STOCK_CAM_DURATION;
+    1.0 + 0.0035 * extra * ((rpm - 4000.0) / 2500.0).clamp(-1.0, 1.0)
 }
 
 /// What VANOS adds: an advanced intake cam fills the cylinders better in the
@@ -190,7 +260,7 @@ fn vanos_ve(rpm: f64, on: bool) -> f64 {
 }
 
 fn ve(engine: &Engine, rpm: f64, vanos_on: bool) -> f64 {
-    intake_ve(engine, rpm) + vanos_ve(rpm, vanos_on)
+    (intake_ve(engine, rpm) + vanos_ve(rpm, vanos_on)) * cam_factor(engine.cam_duration, rpm)
 }
 
 /// Where the standard map switches VANOS on.
@@ -332,7 +402,8 @@ pub fn simulate(engine: &Engine, tune: &Tune, rpm: f64, load: f64) -> Sample {
 
     let timing_eff = (1.0 - 0.0025 * (timing - best_timing(rpm, load)).powi(2)).max(0.5);
     let mixture_eff = (1.0 - 0.012 * (afr - POWER_AFR).powi(2)).max(0.5);
-    let rough_idle = vanos && load <= ROUGH_IDLE_LOAD;
+    let big_cam = engine.cam_duration > LUMPY_CAM_DURATION;
+    let rough_idle = (vanos || big_cam) && load <= ROUGH_IDLE_LOAD;
     let idle_eff = if rough_idle { 0.85 } else { 1.0 };
     let torque_nm = TORQUE_K * air * timing_eff * mixture_eff * idle_eff;
     Sample {
@@ -450,6 +521,31 @@ pub struct Scenario {
     pub tune: Tune,
     pub goals: &'static [Goal],
     pub question: Option<Question>,
+    /// Which engine parts this scenario lets you change.
+    pub hardware: Hardware,
+}
+
+/// Engine parts a scenario lets you change, as opposed to maps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hardware {
+    /// Switch between the standard intake and ITBs.
+    pub intake_choice: bool,
+    pub runner: bool,
+    pub trumpets: bool,
+    pub cams: bool,
+}
+
+impl Hardware {
+    pub const FIXED: Hardware = Hardware {
+        intake_choice: false,
+        runner: false,
+        trumpets: false,
+        cams: false,
+    };
+
+    pub fn any(self) -> bool {
+        self.intake_choice || self.runner || self.trumpets || self.cams
+    }
 }
 
 pub fn scenarios() -> Vec<Scenario> {
@@ -460,6 +556,7 @@ pub fn scenarios() -> Vec<Scenario> {
         bigger_injectors(),
         vanos_switch_points(),
         itb_conversion(),
+        cams_and_trumpets(),
         sandbox(),
     ]
 }
@@ -500,6 +597,7 @@ fn lean_top_end() -> Scenario {
         tune,
         goals: &[Goal::WotAfrInBand, Goal::NoKnock],
         question: None,
+        hardware: Hardware::FIXED,
     }
 }
 
@@ -532,6 +630,7 @@ fn too_much_timing() -> Scenario {
         tune,
         goals: &[Goal::NoKnock, Goal::KeepPower(0.97)],
         question: None,
+        hardware: Hardware::FIXED,
     }
 }
 
@@ -585,6 +684,7 @@ fn vacuum_leak() -> Scenario {
             ],
             correct: 1,
         }),
+        hardware: Hardware::FIXED,
     }
 }
 
@@ -609,6 +709,7 @@ fn bigger_injectors() -> Scenario {
         tune: stock_tune(),
         goals: &[Goal::WotAfrInBand, Goal::TrimsWithin(0.05)],
         question: None,
+        hardware: Hardware::FIXED,
     }
 }
 
@@ -637,6 +738,7 @@ fn vanos_switch_points() -> Scenario {
         tune,
         goals: &[Goal::SmoothIdle, Goal::KeepPower(0.99)],
         question: None,
+        hardware: Hardware::FIXED,
     }
 }
 
@@ -676,21 +778,76 @@ fn itb_conversion() -> Scenario {
             Goal::NoKnock,
         ],
         question: None,
+        hardware: Hardware {
+            runner: true,
+            ..Hardware::FIXED
+        },
+    }
+}
+
+fn cams_and_trumpets() -> Scenario {
+    Scenario {
+        title: "7. Cams and trumpets",
+        story: "An ITB engine with fixed 150 mm manifold runners. You can swap the trumpets \
+                (length and bellmouth shape) and choose a cam. The fuel map is the old one, and \
+                the engine still has to idle nicely on the street.",
+        task: "Make at least 200 bhp, peaking between 6,000 and 6,500 rpm, with a smooth idle. \
+               Then retune full-throttle fuel: AFR 12.5–13.2 and no knock.",
+        hints: &[
+            "Start with the bellmouth: a plain cut pipe makes air trip over the sharp edge and \
+             loses flow everywhere. A full radius bell costs nothing in power.",
+            "Trumpet length adds to the runner, so it moves the tuned RPM just like runner \
+             length did. Shorter trumpets tune higher.",
+            "A longer cam keeps the valves open longer: more top-end power, less low-down \
+             torque. Past about 252° the overlap makes the idle lumpy, which fails the idle check.",
+            "The M52 runs out of revs at about 6,500 rpm, so a huge cam's extra top end is partly \
+             wasted unless the limiter is raised, which needs other engine work.",
+            "Every hardware change alters how the engine breathes, and with ITBs nothing \
+             corrects the fuel for you. Settle the hardware first, then 'Correct from last pull' \
+             on the 100% row.",
+        ],
+        kind: Kind::Tuning,
+        engine: Engine {
+            itb_runner_mm: Some(150.0),
+            trumpet_mm: 100.0,
+            flare: Flare::None,
+            ..Engine::default()
+        },
+        tune: stock_tune(),
+        goals: &[
+            Goal::PeakPowerAtLeast(200.0),
+            Goal::PeakPowerBetween(6000.0, 6500.0),
+            Goal::SmoothIdle,
+            Goal::WotAfrInBand,
+            Goal::NoKnock,
+        ],
+        question: None,
+        hardware: Hardware {
+            trumpets: true,
+            cams: true,
+            ..Hardware::FIXED
+        },
     }
 }
 
 fn sandbox() -> Scenario {
     Scenario {
-        title: "7. Free practice",
-        story: "A healthy standard engine with standard maps.",
-        task: "Change anything and see what happens. Try adding timing until it knocks, or \
-               leaning out the top end and watching the knock appear.",
+        title: "8. Free practice",
+        story: "A healthy standard engine with standard maps. Every part can be changed.",
+        task: "Change anything and see what happens. Try adding timing until it knocks, \
+               leaning out the top end, fitting ITBs, or a big cam.",
         hints: &[],
         kind: Kind::Sandbox,
         engine: Engine::default(),
         tune: stock_tune(),
         goals: &[],
         question: None,
+        hardware: Hardware {
+            intake_choice: true,
+            runner: true,
+            trumpets: true,
+            cams: true,
+        },
     }
 }
 
@@ -786,10 +943,16 @@ pub fn assess(scenario: &Scenario, engine: &Engine, tune: &Tune) -> Vec<Check> {
                 let (_, idle) = snapshots(engine, tune)[0];
                 Check {
                     ok: !idle.rough_idle,
-                    text: if idle.rough_idle {
+                    text: if !idle.rough_idle {
+                        "Idle is smooth.".into()
+                    } else if idle.vanos {
                         "Idle is lumpy: VANOS is on at idle.".into()
                     } else {
-                        "Idle is smooth (VANOS off at idle).".into()
+                        format!(
+                            "Idle is lumpy: {:.0}° cam duration gives too much valve overlap \
+                             (smooth up to about {LUMPY_CAM_DURATION:.0}°).",
+                            engine.cam_duration
+                        )
                     },
                 }
             }
@@ -1042,9 +1205,93 @@ mod tests {
         );
     }
 
+    /// Fuel corrected from one full-throttle pull, as the practice tab does.
+    fn retuned(engine: &Engine, tune: &Tune) -> Tune {
+        let pull = dyno_pull(engine, tune);
+        let mut t = tune.clone();
+        for (col, &rpm) in RPM_AXIS.iter().enumerate() {
+            if let Some(p) = pull.iter().find(|p| p.rpm == rpm) {
+                t.fuel.set(
+                    9,
+                    col,
+                    t.fuel.get(9, col) * fuel_correction(p.afr, POWER_AFR),
+                );
+            }
+        }
+        t
+    }
+
+    #[test]
+    fn cams_and_trumpets_needs_a_balanced_choice() {
+        let s = scenario(6);
+        assert!(!all_ok(&assess(&s, &s.engine, &s.tune)));
+
+        let good = Engine {
+            trumpet_mm: 50.0,
+            flare: Flare::Full,
+            cam_duration: 248.0,
+            ..s.engine
+        };
+        let checks = assess(&s, &good, &retuned(&good, &s.tune));
+        assert!(
+            all_ok(&checks),
+            "{:?}",
+            checks.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+
+        let lumpy = Engine {
+            cam_duration: 264.0,
+            ..good
+        };
+        let checks = assess(&s, &lumpy, &retuned(&lumpy, &s.tune));
+        assert!(checks.iter().any(|c| !c.ok && c.text.contains("lumpy")));
+    }
+
+    #[test]
+    fn longer_cams_trade_low_end_for_top_end() {
+        let stock = Engine::default();
+        let big = Engine {
+            cam_duration: 260.0,
+            ..stock
+        };
+        let tune = stock_tune();
+        let torque_2000 = |e: &Engine| simulate(e, &tune, 2000.0, 100.0).torque_nm;
+        let peak = |e: &Engine| peak_power(&dyno_pull(e, &tune)).power_bhp;
+        assert!(torque_2000(&big) < torque_2000(&stock));
+        assert!(peak(&big) > peak(&stock));
+        assert!(snapshots(&big, &tune)[0].1.rough_idle);
+        assert!(!snapshots(&stock, &tune)[0].1.rough_idle);
+    }
+
+    #[test]
+    fn bellmouth_flows_better_than_a_plain_pipe() {
+        let itb = |flare| Engine {
+            itb_runner_mm: Some(200.0),
+            flare,
+            ..Engine::default()
+        };
+        let torque = |e: Engine| simulate(&e, &stock_tune(), 5000.0, 100.0).torque_nm;
+        assert!(torque(itb(Flare::Full)) > torque(itb(Flare::Small)));
+        assert!(torque(itb(Flare::Small)) > torque(itb(Flare::None)));
+    }
+
+    #[test]
+    fn trumpets_lengthen_the_intake_and_tune_lower() {
+        let short = Engine {
+            itb_runner_mm: Some(150.0),
+            ..Engine::default()
+        };
+        let long = Engine {
+            trumpet_mm: 100.0,
+            ..short
+        };
+        assert!(intake_tuned_rpm(&long).unwrap() < intake_tuned_rpm(&short).unwrap());
+        assert_eq!(intake_tuned_rpm(&Engine::default()), None);
+    }
+
     #[test]
     fn sandbox_has_no_goals() {
-        let s = scenario(6);
+        let s = scenario(7);
         assert!(assess(&s, &s.engine, &s.tune).is_empty());
     }
 }

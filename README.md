@@ -83,7 +83,12 @@ comparison. Scenarios, each with a task, hints and pass/fail checks:
    move the torque peak up the revs), and why ITBs, which fuel from throttle
    position instead of an air flow meter, need the fuel map retuned whenever
    breathing changes.
-7. **Free practice**: a healthy engine to experiment with.
+7. **Cams and trumpets**: on an ITB engine with fixed runners, choose trumpet
+   length (it adds to the runner, so it moves the tuned RPM), the bellmouth
+   shape (a plain pipe loses flow), and cam duration (more top end, less
+   low-down torque, and a lumpy idle if you go too far).
+8. **Free practice**: a healthy engine where every part can be changed:
+   standard intake or ITBs, runners, trumpets and cams.
 
 ![VANOS practice](docs/practice-vanos.png)
 

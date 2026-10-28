@@ -6,9 +6,10 @@ use std::collections::BTreeSet;
 use eframe::egui;
 use egui_plot::{HLine, Legend, Line, LineStyle, Plot, PlotPoints};
 use tunesim::{
-    assess, cam_comparison, dyno_pull, fuel_correction, itb_tuned_rpm, snapshots, Check, Engine,
-    Kind, Sample, Scenario, Table, Tune, HEAD_PORT_MM, LEAN_WARNING, LOAD_AXIS, POWER_AFR,
-    RPM_AXIS, RUNNER_RANGE_MM, WOT_BAND,
+    assess, cam_comparison, dyno_pull, fuel_correction, intake_tuned_rpm, snapshots, Check, Engine,
+    Flare, Kind, Sample, Scenario, Table, Tune, CAM_RANGE, HEAD_PORT_MM, LEAN_WARNING, LOAD_AXIS,
+    LUMPY_CAM_DURATION, POWER_AFR, RPM_AXIS, RUNNER_RANGE_MM, STOCK_CAM_DURATION, TRUMPET_RANGE_MM,
+    WOT_BAND,
 };
 
 const PASS: egui::Color32 = egui::Color32::from_rgb(60, 180, 90);
@@ -241,7 +242,14 @@ impl Practice {
                         ui.monospace(trim);
                     }
                     if s.rough_idle {
-                        ui.colored_label(FAIL, "ON (lumpy idle)");
+                        ui.colored_label(
+                            FAIL,
+                            if s.vanos {
+                                "ON (lumpy idle)"
+                            } else {
+                                "off (lumpy idle: big cam)"
+                            },
+                        );
                     } else {
                         ui.label(if s.vanos { "ON" } else { "off" });
                     }
@@ -304,8 +312,8 @@ impl Practice {
             .default_open(true)
             .show(ui, |ui| self.trims(ui));
         ui.add_space(6.0);
-        if let Some(mut mm) = self.engine.itb_runner_mm {
-            self.runner_slider(ui, &mut mm);
+        if self.scenario().hardware.any() {
+            self.hardware(ui);
         }
 
         ui.horizontal(|ui| {
@@ -368,35 +376,107 @@ impl Practice {
         }
     }
 
-    fn runner_slider(&mut self, ui: &mut egui::Ui, mm: &mut f64) {
+    /// Engine parts the scenario lets you change: intake, runners, trumpets, cams.
+    fn hardware(&mut self, ui: &mut egui::Ui) {
+        let hw = self.scenario().hardware;
+        let mut e = self.engine;
         ui.group(|ui| {
-            ui.horizontal(|ui| {
-                ui.label("ITB runner length");
-                let (lo, hi) = RUNNER_RANGE_MM;
-                if ui
-                    .add(egui::Slider::new(mm, lo..=hi).step_by(5.0).suffix(" mm"))
-                    .changed()
-                {
-                    self.engine.itb_runner_mm = Some(*mm);
-                    // Results were for the old runners.
-                    self.checks = None;
-                    self.compare = None;
+            ui.set_width(ui.available_width());
+            ui.strong("Engine hardware");
+            if hw.intake_choice {
+                ui.horizontal(|ui| {
+                    ui.label("Intake");
+                    let mut itb = e.itb_runner_mm.is_some();
+                    ui.radio_value(&mut itb, false, "Standard (air flow meter)");
+                    ui.radio_value(&mut itb, true, "ITBs (fuel from throttle position)");
+                    match (itb, e.itb_runner_mm) {
+                        (true, None) => e.itb_runner_mm = Some(200.0),
+                        (false, Some(_)) => e.itb_runner_mm = None,
+                        _ => {}
+                    }
+                });
+            }
+            if let Some(mut runner) = e.itb_runner_mm {
+                ui.horizontal(|ui| {
+                    ui.label("Runner length");
+                    if hw.runner {
+                        let (lo, hi) = RUNNER_RANGE_MM;
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut runner, lo..=hi)
+                                    .step_by(5.0)
+                                    .suffix(" mm"),
+                            )
+                            .changed()
+                        {
+                            e.itb_runner_mm = Some(runner);
+                        }
+                    } else {
+                        ui.label(format!("{runner:.0} mm (fixed)"));
+                    }
+                });
+                if hw.trumpets {
+                    ui.horizontal(|ui| {
+                        ui.label("Trumpet length");
+                        let (lo, hi) = TRUMPET_RANGE_MM;
+                        ui.add(
+                            egui::Slider::new(&mut e.trumpet_mm, lo..=hi)
+                                .step_by(5.0)
+                                .suffix(" mm"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Bellmouth");
+                        for f in Flare::ALL {
+                            ui.radio_value(&mut e.flare, f, f.label());
+                        }
+                    });
+                }
+                if let Some(rpm) = intake_tuned_rpm(&e) {
+                    ui.label(
+                        egui::RichText::new(format!("Intake tuned for about {rpm:.0} rpm"))
+                            .strong(),
+                    );
                 }
                 ui.label(
-                    egui::RichText::new(format!("tuned for about {:.0} rpm", itb_tuned_rpm(*mm)))
-                        .strong(),
+                    egui::RichText::new(format!(
+                        "Tuned length = runner + trumpet + the {HEAD_PORT_MM:.0} mm port in the \
+                         head. Shorter tunes higher up the revs; longer gives more low-down torque."
+                    ))
+                    .small()
+                    .weak(),
                 );
-            });
-            ui.label(
-                egui::RichText::new(format!(
-                    "Runner plus the {HEAD_PORT_MM:.0} mm port in the head. Shorter runners move \
-                     the torque peak up the revs; longer runners give more low-down torque. \
-                     Run a pull after each change."
-                ))
-                .small()
-                .weak(),
-            );
+            }
+            if hw.cams {
+                ui.horizontal(|ui| {
+                    ui.label("Cam duration");
+                    let (lo, hi) = CAM_RANGE;
+                    ui.add(
+                        egui::Slider::new(&mut e.cam_duration, lo..=hi)
+                            .step_by(1.0)
+                            .suffix("°"),
+                    );
+                    if e.cam_duration > LUMPY_CAM_DURATION {
+                        ui.colored_label(WARN, "lumpy idle");
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Baseline {STOCK_CAM_DURATION:.0}° (illustrative, not an exact M52 spec). \
+                         Longer duration: more top-end power, less low-down torque, and above \
+                         about {LUMPY_CAM_DURATION:.0}° a lumpy idle."
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
         });
+        if e != self.engine {
+            self.engine = e;
+            // Results were for the old hardware.
+            self.checks = None;
+            self.compare = None;
+        }
         ui.add_space(6.0);
     }
 
